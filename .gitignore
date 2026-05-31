@@ -11,13 +11,14 @@ datasets/
 artifacts/
 runs/
 checkpoints/
-models/
 *.pt
 *.pth
 *.ckpt
-*.onnx
 *.mp4
 *.mov
 *.wav
 *.npy
 *.npz
+
+models/**
+!models/.gitkeep

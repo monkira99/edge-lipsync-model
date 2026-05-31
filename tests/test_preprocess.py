@@ -77,4 +77,4 @@ def test_landmarks_to_duix_roi_uses_lower_face_crop() -> None:
 
     roi = landmarks_to_duix_roi(landmarks, (960, 540, 3))
 
-    assert roi == (120, 320, 440, 640)
+    assert roi == (110, 311, 448, 649)

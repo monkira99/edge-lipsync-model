@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5", "pyright[dev]>=1.1.409"]
+ncnn = ["ncnn==1.0.20260114"]
 
 [tool.setuptools.packages.find]
 include = ["edge_lipsync*"]
