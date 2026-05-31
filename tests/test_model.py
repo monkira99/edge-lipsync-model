@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -48,3 +49,25 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
 
     assert isinstance(loaded, DuixUNet)
     assert ckpt_path.exists()
+
+
+def test_save_ckpt_preserves_existing_file_when_torch_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from edge_lipsync.model import DuixUNet, save_ckpt
+
+    ckpt_path = tmp_path / "model.pt"
+    ckpt_path.write_bytes(b"existing checkpoint")
+
+    def fail_save(payload: object, path: str) -> None:
+        Path(path).write_bytes(b"partial checkpoint")
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        save_ckpt(DuixUNet(), ckpt_path)
+
+    assert ckpt_path.read_bytes() == b"existing checkpoint"
+    assert not (tmp_path / "model.pt.tmp").exists()

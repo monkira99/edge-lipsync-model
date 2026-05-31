@@ -569,7 +569,15 @@ def save_ckpt(model: DuixUNet, ckpt_path: str | Path, face_size: int = 160, extr
         'extra': extra or {},
         'spec_count': 165,
     }
-    torch.save(payload, str(ckpt_path))
+    out = Path(ckpt_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + '.tmp')
+    try:
+        torch.save(payload, str(tmp))
+        tmp.replace(out)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def load_ckpt(ckpt_path: str | Path, *, map_location: str | torch.device = 'cpu', strict: bool = True) -> DuixUNet:

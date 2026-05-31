@@ -15,8 +15,12 @@ def atomic_torch_save(payload: dict[str, Any], path: str | Path) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".tmp")
-    torch.save(payload, tmp)
-    tmp.replace(out)
+    try:
+        torch.save(payload, tmp)
+        tmp.replace(out)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def make_training_checkpoint(

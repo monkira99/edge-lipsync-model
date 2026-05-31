@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -16,6 +17,28 @@ def test_atomic_torch_save_roundtrip(tmp_path: Path) -> None:
 
     loaded = torch.load(out, map_location="cpu")
     assert loaded["value"].tolist() == [1, 2, 3]
+    assert not (tmp_path / "payload.pt.tmp").exists()
+
+
+def test_atomic_torch_save_removes_temp_file_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from edge_lipsync.checkpoint import atomic_torch_save
+
+    out = tmp_path / "payload.pt"
+    out.write_bytes(b"existing checkpoint")
+
+    def fail_save(payload: object, path: Path) -> None:
+        path.write_bytes(b"partial checkpoint")
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        atomic_torch_save({"value": 1}, out)
+
+    assert out.read_bytes() == b"existing checkpoint"
     assert not (tmp_path / "payload.pt.tmp").exists()
 
 
