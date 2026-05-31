@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+
+def test_validate_stream_payload_requires_audio_and_video() -> None:
+    from edge_lipsync.build_dataset import validate_stream_payload
+
+    with pytest.raises(ValueError, match="audio"):
+        validate_stream_payload({"streams": [{"codec_type": "video"}]})
+
+
+def test_interpolate_short_bbox_gaps_preserves_long_gaps() -> None:
+    from edge_lipsync.build_dataset import interpolate_short_bbox_gaps
+
+    boxes = {
+        1: (10, 10, 110, 110),
+        2: None,
+        3: (14, 10, 114, 110),
+        4: None,
+        5: None,
+        6: (20, 10, 120, 110),
+    }
+
+    interpolated, flags = interpolate_short_bbox_gaps(boxes, max_gap=1)
+
+    assert interpolated[2] == (12, 10, 112, 110)
+    assert interpolated[4] is None
+    assert interpolated[5] is None
+    assert flags == {2: ["interpolated_bbox"]}
+
+
+def test_smooth_bboxes_uses_neighboring_frames() -> None:
+    from edge_lipsync.build_dataset import smooth_bboxes
+
+    smoothed = smooth_bboxes(
+        {
+            1: (10, 10, 100, 100),
+            2: (20, 20, 120, 120),
+        },
+        radius=1,
+    )
+
+    assert smoothed[1] == (15, 15, 110, 110)
+    assert smoothed[2] == (15, 15, 110, 110)
+
+
+@pytest.mark.parametrize(
+    ("bbox", "reason"),
+    [
+        ((10, 10, 10, 20), "invalid"),
+        ((-1, 10, 50, 50), "outside_frame"),
+        ((10, 10, 20, 20), "too_small"),
+        ((0, 0, 100, 100), "too_large"),
+    ],
+)
+def test_bbox_quality_reason_applies_gates(
+    bbox: tuple[int, int, int, int],
+    reason: str,
+) -> None:
+    from edge_lipsync.build_dataset import BBoxGates, bbox_quality_reason
+
+    gates = BBoxGates(min_size=32, max_frame_fraction=0.9, max_jump_fraction=0.5)
+
+    assert bbox_quality_reason(bbox, (100, 100, 3), gates) == reason
+
+
+def test_limit_silence_keeps_all_voice_and_caps_silence() -> None:
+    from edge_lipsync.build_dataset import limit_silence
+
+    frame_indices = list(range(1, 11))
+    silent_audio_indices = {0, 1, 2, 3, 4, 5, 6, 7}
+
+    kept, dropped = limit_silence(
+        frame_indices,
+        silent_audio_indices=silent_audio_indices,
+        max_silence_fraction=0.5,
+    )
+
+    assert {9, 10}.issubset(kept)
+    assert len(kept) == 4
+    assert dropped == 6
+
+
+def test_write_manifest_creates_relative_records_and_splits(tmp_path: Path) -> None:
+    from edge_lipsync.build_dataset import write_manifest
+
+    clips = [
+        {
+            "clip_id": "a",
+            "valid_frames": [1, 2],
+            "bboxes": {1: (10, 10, 100, 100), 2: (12, 10, 102, 100)},
+            "flags": {2: ["interpolated_bbox"]},
+        },
+        {
+            "clip_id": "b",
+            "valid_frames": [1, 2],
+            "bboxes": {1: (20, 20, 120, 120), 2: (22, 20, 122, 120)},
+            "flags": {},
+        },
+    ]
+
+    split_counts = write_manifest(tmp_path, clips, validation_fraction=0.5)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert len(rows) == 4
+    assert rows[0]["frame_path"] == "clips/a/frames/000001.jpg"
+    assert rows[1]["flags"] == ["interpolated_bbox"]
+    assert {row["split"] for row in rows} == {"train", "val"}
+    assert split_counts == {"train": 2, "val": 2}
+
+
+def test_write_preview_outputs_overlay_real_masked_and_target(tmp_path: Path) -> None:
+    from edge_lipsync.build_dataset import write_preview
+
+    frame = np.full((240, 320, 3), 120, dtype=np.uint8)
+
+    write_preview(frame, (80, 40, 240, 200), tmp_path, frame_idx=1)
+
+    assert sorted(path.name for path in tmp_path.glob("*.jpg")) == [
+        "000001_masked.jpg",
+        "000001_overlay.jpg",
+        "000001_real.jpg",
+        "000001_target.jpg",
+    ]
+
+
+def test_build_dataset_records_clip_failure_unless_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "broken.mp4").write_bytes(b"not a real video")
+    wenet = tmp_path / "wenet.onnx"
+    wenet.write_bytes(b"fixture")
+    config = builder.DatasetBuildConfig(
+        raw_video_dir=str(raw_dir),
+        dataset_root=str(tmp_path / "dataset"),
+        wenet_onnx=str(wenet),
+    )
+
+    def fail_clip(video: Path, config: builder.DatasetBuildConfig) -> dict[str, object]:
+        raise RuntimeError(f"cannot process {video.name}")
+
+    monkeypatch.setattr(builder, "process_clip", fail_clip)
+
+    summary = builder.build_dataset(config)
+
+    assert summary["processed_clips"] == 0
+    assert len(summary["failed_clips"]) == 1
+    quality = json.loads(
+        (tmp_path / "dataset/clips/broken/quality.json").read_text(encoding="utf-8")
+    )
+    assert quality["status"] == "failed"
+    with pytest.raises(RuntimeError, match="cannot process"):
+        builder.build_dataset(config, strict=True)
+
+
+def test_build_dataset_cli_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "tools/build_dataset.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Build Duix training dataset" in result.stdout
+    assert "--strict" in result.stdout
