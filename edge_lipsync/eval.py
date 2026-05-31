@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 
 from edge_lipsync.dataset import DuixManifestDataset
 from edge_lipsync.losses import charbonnier_loss, mouth_weighted_l1
+from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,43 @@ class RenderEvalConfig:
     max_batches: int = 32
     device: str = "cpu"
     fps: float = 25.0
+    hf_dataset_repo: str = ""
+    hf_dataset_revision: str = ""
+    hf_model_repo: str = ""
+    hf_model_revision: str = ""
+    hf_model_filename: str = "best.pt"
+    hf_cache_dir: str = ""
+
+
+@dataclass(frozen=True)
+class ResolvedEvalInputs:
+    dataset_root: Path
+    checkpoint: Path
+    provenance: dict[str, Any]
+
+
+def resolve_eval_inputs(config: RenderEvalConfig) -> ResolvedEvalInputs:
+    dataset = resolve_dataset_source(
+        dataset_root=config.dataset_root,
+        hf_repo=config.hf_dataset_repo,
+        hf_revision=config.hf_dataset_revision,
+        cache_dir=config.hf_cache_dir,
+    )
+    model = resolve_model_source(
+        checkpoint=config.ckpt,
+        hf_repo=config.hf_model_repo,
+        hf_revision=config.hf_model_revision,
+        hf_filename=config.hf_model_filename,
+        cache_dir=config.hf_cache_dir,
+    )
+    return ResolvedEvalInputs(
+        dataset_root=dataset.path,
+        checkpoint=model.path,
+        provenance={
+            "dataset": dataset.provenance,
+            "model": model.provenance,
+        },
+    )
 
 
 def chw_norm_to_rgb_u8(chw: np.ndarray) -> np.ndarray:

@@ -33,6 +33,7 @@ def make_training_checkpoint(
     epoch: int,
     metrics: dict[str, float | int],
     init_weight_source: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = Path(manifest_path)
     return {
@@ -46,6 +47,7 @@ def make_training_checkpoint(
         "epoch": int(epoch),
         "metrics": metrics,
         "init_weight_source": init_weight_source,
+        "provenance": provenance or {},
     }
 
 

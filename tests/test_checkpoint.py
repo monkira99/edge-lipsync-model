@@ -72,6 +72,28 @@ def test_make_training_checkpoint_includes_reproducibility_metadata(tmp_path: Pa
     assert payload["init_weight_source"]["kind"] == "ncnn_bin"
 
 
+def test_make_training_checkpoint_includes_provenance(tmp_path: Path) -> None:
+    from edge_lipsync.checkpoint import make_training_checkpoint
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"clip_id":"clip_001"}\n', encoding="utf-8")
+    model = torch.nn.Conv2d(6, 3, kernel_size=1)
+
+    payload = make_training_checkpoint(
+        model=model,
+        training_config={},
+        dataset_root=tmp_path,
+        manifest_path=manifest,
+        step=1,
+        epoch=1,
+        metrics={},
+        init_weight_source={"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        provenance={"dataset": {"source": "local"}},
+    )
+
+    assert payload["provenance"] == {"dataset": {"source": "local"}}
+
+
 def test_export_checkpoint_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/export_checkpoint.py", "--help"],
