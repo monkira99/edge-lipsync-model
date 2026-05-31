@@ -11,11 +11,9 @@ datasets/
 artifacts/
 runs/
 checkpoints/
-models/
 *.pt
 *.pth
 *.ckpt
-*.onnx
 *.mp4
 *.mov
 *.wav
