@@ -99,6 +99,43 @@ The default bbox detector is `mediapipe_face_landmarker`, which derives the Duix
 from face landmarks. `haar` remains available only as a debug fallback and produces full-face
 boxes, not production Duix ROI boxes.
 
+## Build Hugging Face Video Dataset
+
+Use `tools/build_hf_video_dataset.py` for HF datasets that already contain synced MP4 clips. This
+fits `Pinch-Research/lipsync-hdtf-training-data` because the teacher videos live under
+`xdub_teacher_pairs/videos/` and already include muxed audio. Use a pinned dataset revision and
+start with `--dry-run` plus `--max-videos`.
+
+```bash
+.venv/bin/python tools/build_hf_video_dataset.py \
+  --repo-id Pinch-Research/lipsync-hdtf-training-data \
+  --revision pinned_dataset_commit_sha \
+  --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
+  --work-dir /absolute/path/to/work/hdtf_xdub \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --video-prefix xdub_teacher_pairs/videos \
+  --metadata-prefix xdub_teacher_pairs/meta \
+  --max-videos 20 \
+  --dry-run
+```
+
+When the selected subset looks correct, remove `--dry-run`. Add `--push` to publish the processed
+dataset snapshot after the build:
+
+```bash
+.venv/bin/python tools/build_hf_video_dataset.py \
+  --repo-id Pinch-Research/lipsync-hdtf-training-data \
+  --revision pinned_dataset_commit_sha \
+  --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
+  --work-dir /absolute/path/to/work/hdtf_xdub \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --max-videos 20 \
+  --push \
+  --hf-output-repo-id username/hdtf-xdub-duix-dataset
+```
+
 ## Build GRID Baseline Dataset
 
 Use the GRID adapter to create a small baseline dataset from an extracted GRID corpus, then push
