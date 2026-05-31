@@ -57,3 +57,24 @@ def test_adjust_bbox_clips_to_frame() -> None:
     box = adjust_bbox((10, 20, 110, 120), (100, 100, 3), dx=-20, dy=-30, scale=2.0)
 
     assert box == (0, 0, 100, 100)
+
+
+def test_landmarks_to_duix_roi_uses_lower_face_crop() -> None:
+    from edge_lipsync.preprocess import landmarks_to_duix_roi
+
+    landmarks = {
+        1: (280.0, 360.0),
+        13: (280.0, 460.0),
+        14: (280.0, 480.0),
+        33: (180.0, 280.0),
+        61: (230.0, 470.0),
+        152: (280.0, 600.0),
+        234: (120.0, 390.0),
+        263: (380.0, 280.0),
+        291: (330.0, 470.0),
+        454: (440.0, 390.0),
+    }
+
+    roi = landmarks_to_duix_roi(landmarks, (960, 540, 3))
+
+    assert roi == (120, 320, 440, 640)

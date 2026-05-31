@@ -18,9 +18,11 @@ from edge_lipsync.audio_features import (
     load_wav_mono_f32,
     split_audio_blocks,
 )
+from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
 from edge_lipsync.preprocess import make_face_training_sample
 
 BBox = tuple[int, int, int, int]
+SUPPORTED_BBOX_DETECTORS = {"mediapipe_face_landmarker", "mediapipe_face_mesh", "haar"}
 
 
 def _rounded_bbox(values: Iterable[float]) -> BBox:
@@ -44,7 +46,11 @@ class DatasetBuildConfig:
     sample_rate: int = 16000
     split_strategy: str = "clip"
     validation_fraction: float = 0.2
-    bbox_detector: str = "haar"
+    bbox_detector: str = "mediapipe_face_landmarker"
+    landmark_model_asset_path: str | None = None
+    landmark_min_detection_confidence: float = 0.5
+    landmark_min_tracking_confidence: float = 0.5
+    landmark_refine_landmarks: bool = True
     preview_count: int = 8
     min_bbox_size: int = 32
     max_bbox_frame_fraction: float = 0.9
@@ -147,6 +153,32 @@ def detect_largest_face(frame_bgr: np.ndarray) -> BBox | None:
         return None
     x, y, width, height = max(faces, key=lambda rect: int(rect[2]) * int(rect[3]))
     return int(x), int(y), int(x + width), int(y + height)
+
+
+class HaarFaceDetector:
+    def detect_bbox(self, frame_bgr: np.ndarray) -> BBox | None:
+        return detect_largest_face(frame_bgr)
+
+    def close(self) -> None:
+        pass
+
+
+def create_bbox_detector(
+    config: DatasetBuildConfig,
+) -> HaarFaceDetector | MediaPipeFaceLandmarkerDetector:
+    if config.bbox_detector == "haar":
+        return HaarFaceDetector()
+    if config.bbox_detector in {"mediapipe_face_landmarker", "mediapipe_face_mesh"}:
+        return MediaPipeFaceLandmarkerDetector(
+            model_asset_path=config.landmark_model_asset_path,
+            min_detection_confidence=config.landmark_min_detection_confidence,
+            min_tracking_confidence=config.landmark_min_tracking_confidence,
+            refine_landmarks=config.landmark_refine_landmarks,
+        )
+    raise ValueError(
+        f"Unsupported bbox_detector={config.bbox_detector!r}; "
+        f"expected one of {sorted(SUPPORTED_BBOX_DETECTORS)}"
+    )
 
 
 def bbox_quality_reason(
@@ -392,14 +424,18 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
     bnf = extract_bnf_windows_from_wav(audio_path, config.wenet_onnx)
     np.save(clip_dir / "bnf.npy", bnf.astype(np.float32))
 
+    detector = create_bbox_detector(config)
     detected: dict[int, BBox | None] = {}
     frame_shapes: dict[int, tuple[int, ...]] = {}
-    for frame_idx in range(1, frame_count + 1):
-        frame = cv2.imread(str(frames_dir / f"{frame_idx:06d}.jpg"), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise RuntimeError(f"Cannot read extracted frame {frame_idx} for {clip_id}")
-        frame_shapes[frame_idx] = frame.shape
-        detected[frame_idx] = detect_largest_face(frame)
+    try:
+        for frame_idx in range(1, frame_count + 1):
+            frame = cv2.imread(str(frames_dir / f"{frame_idx:06d}.jpg"), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise RuntimeError(f"Cannot read extracted frame {frame_idx} for {clip_id}")
+            frame_shapes[frame_idx] = frame.shape
+            detected[frame_idx] = detector.detect_bbox(frame)
+    finally:
+        detector.close()
     gates = BBoxGates(
         min_size=config.min_bbox_size,
         max_frame_fraction=config.max_bbox_frame_fraction,
@@ -441,6 +477,8 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
         "status": "ready" if valid_frames else "no_valid_samples",
         "frame_count": frame_count,
         "bnf_shape": list(bnf.shape),
+        "bbox_detector": config.bbox_detector,
+        "bbox_semantics": "duix_roi_xyxy",
         "detected_bboxes": sum(value is not None for value in detected.values()),
         "valid_samples": len(valid_frames),
         "drop_counts": drop_counts,
@@ -460,8 +498,11 @@ def build_dataset(config: DatasetBuildConfig, *, strict: bool = False) -> dict[s
         raise ValueError("Phase 1 requires fps=25 and sample_rate=16000")
     if config.split_strategy != "clip":
         raise ValueError("Only split_strategy='clip' is supported")
-    if config.bbox_detector != "haar":
-        raise ValueError("Only bbox_detector='haar' is supported")
+    if config.bbox_detector not in SUPPORTED_BBOX_DETECTORS:
+        raise ValueError(
+            f"Unsupported bbox_detector={config.bbox_detector!r}; "
+            f"expected one of {sorted(SUPPORTED_BBOX_DETECTORS)}"
+        )
     raw_dir = Path(config.raw_video_dir)
     if not raw_dir.is_dir():
         raise FileNotFoundError(raw_dir)

@@ -17,6 +17,20 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
+For landmark-based dataset building, install MediaPipe in the same environment:
+
+```bash
+.venv/bin/python -m pip install mediapipe
+```
+
+Current MediaPipe Tasks also needs a FaceLandmarker model asset. Download
+`face_landmarker.task` from Google's model bucket and set `landmark_model_asset_path` in the
+dataset config:
+
+```text
+https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+```
+
 ## Verify
 
 ```bash
@@ -41,6 +55,9 @@ python3.12 -m venv .venv
 
 Add `--strict` to fail immediately when any clip fails. Without it, clip-level failures are
 recorded in the clip `quality.json` and summarized after the remaining clips are processed.
+The default bbox detector is `mediapipe_face_landmarker`, which derives the Duix lower-face ROI
+from face landmarks. `haar` remains available only as a debug fallback and produces full-face
+boxes, not production Duix ROI boxes.
 
 ## Train
 
