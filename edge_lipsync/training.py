@@ -11,13 +11,16 @@ import torch
 from torch.utils.data import DataLoader
 
 from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
-from edge_lipsync.dataset import DuixManifestDataset
+from edge_lipsync.dataset import DuixManifestDataset, manifest_sha256
+from edge_lipsync.hub import push_model_artifacts
 from edge_lipsync.losses import (
     charbonnier_loss,
     combined_reconstruction_loss,
     mouth_weighted_l1,
 )
 from edge_lipsync.model import DuixUNet, load_ckpt
+from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
+from edge_lipsync.tracking import WandbConfig, create_tracker
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,22 @@ class TrainConfig:
     stabilization_lr_scale: float = 0.1
     validation_interval: int = 100
     checkpoint_interval: int = 100
+    hf_dataset_repo: str = ""
+    hf_dataset_revision: str = ""
+    hf_cache_dir: str = ""
+    hf_init_model_repo: str = ""
+    hf_init_model_revision: str = ""
+    hf_init_model_filename: str = "best.pt"
+    hf_model_repo: str = ""
+    hf_model_private: bool = True
+    wandb_mode: str = "disabled"
+    wandb_project: str = "edge-lipsync-model"
+    wandb_entity: str = ""
+    wandb_run_name: str = ""
+    wandb_group: str = ""
+    wandb_tags: tuple[str, ...] = ()
+    wandb_notes: str = ""
+    wandb_dir: str = ""
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -173,14 +192,27 @@ def set_training_phase(model: torch.nn.Module, phase: str) -> None:
 
 
 def build_model(config: TrainConfig, device: torch.device) -> tuple[DuixUNet, dict[str, Any]]:
-    if bool(config.init_bin) == bool(config.init_ckpt):
-        raise ValueError("Set exactly one of init_bin or init_ckpt")
-    if config.init_ckpt:
-        checkpoint = Path(config.init_ckpt)
-        if not checkpoint.exists():
-            raise FileNotFoundError(checkpoint)
-        model = load_ckpt(checkpoint, map_location=device).to(device)
-        return model, {"kind": "pytorch_checkpoint", "path": str(checkpoint.resolve())}
+    init_source_count = sum(
+        bool(value)
+        for value in (
+            config.init_bin,
+            config.init_ckpt,
+            config.hf_init_model_repo,
+        )
+    )
+    if init_source_count != 1:
+        raise ValueError("Set exactly one of init_bin, init_ckpt, or hf_init_model_repo")
+    if config.init_ckpt or config.hf_init_model_repo:
+        resolved = resolve_model_source(
+            checkpoint=config.init_ckpt,
+            hf_repo=config.hf_init_model_repo,
+            hf_revision=config.hf_init_model_revision,
+            hf_filename=config.hf_init_model_filename,
+            cache_dir=config.hf_cache_dir,
+        )
+        model = load_ckpt(resolved.path, map_location=device).to(device)
+        kind = "huggingface_checkpoint" if config.hf_init_model_repo else "pytorch_checkpoint"
+        return model, {"kind": kind, **resolved.provenance}
     init_bin = Path(config.init_bin)
     if not init_bin.exists():
         raise FileNotFoundError(init_bin)
@@ -204,15 +236,73 @@ def _write_metrics(metrics: list[dict[str, float | int | str]], run_dir: Path) -
         writer.writerows(metrics)
 
 
+def write_run_metadata(
+    run_dir: str | Path,
+    *,
+    provenance: dict[str, Any],
+    best_checkpoint: str | Path,
+    final_checkpoint: str | Path,
+) -> Path:
+    output = Path(run_dir) / "run_metadata.json"
+    payload = {
+        "provenance": provenance,
+        "artifacts": {
+            "best_checkpoint": str(Path(best_checkpoint).resolve()),
+            "final_checkpoint": str(Path(final_checkpoint).resolve()),
+        },
+    }
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return output
+
+
+def write_model_card(run_dir: str | Path, *, provenance: dict[str, Any]) -> Path:
+    dataset = provenance.get("dataset", {})
+    wandb = provenance.get("wandb", {})
+    model = provenance.get("model", {})
+    lines = [
+        "# Edge Lip-Sync Duix UNet Checkpoint",
+        "",
+        "This repository contains checkpoints produced by the edge-lipsync-model pipeline.",
+        "",
+        "## Provenance",
+        "",
+        f"- Dataset source: `{dataset.get('source', '')}`",
+        f"- Dataset repository: `{dataset.get('repo_id', '')}`",
+        f"- Dataset revision: `{dataset.get('resolved_revision', '')}`",
+        f"- W&B run: {wandb.get('run_url', '')}",
+        f"- Model repository: `{model.get('repo_id', '')}`",
+        f"- Model revision: `{model.get('resolved_revision', '')}`",
+        "",
+    ]
+    output = Path(run_dir) / "README.md"
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return output
+
+
+def _wandb_config(config: TrainConfig) -> WandbConfig:
+    return WandbConfig(
+        mode=config.wandb_mode,
+        project=config.wandb_project,
+        entity=config.wandb_entity,
+        run_name=config.wandb_run_name,
+        group=config.wandb_group,
+        tags=tuple(config.wandb_tags),
+        notes=config.wandb_notes,
+        directory=config.wandb_dir,
+    )
+
+
 def _checkpoint_payload(
     *,
     model: torch.nn.Module,
     config: TrainConfig,
+    dataset_root: Path,
     manifest_path: Path,
     step: int,
     epoch: int,
     metrics: dict[str, float | int | str],
     init_weight_source: dict[str, Any],
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     numeric_metrics = {
         key: value for key, value in metrics.items() if isinstance(value, (float, int))
@@ -220,12 +310,13 @@ def _checkpoint_payload(
     return make_training_checkpoint(
         model=model,
         training_config=asdict(config),
-        dataset_root=config.dataset_root,
+        dataset_root=dataset_root,
         manifest_path=manifest_path,
         step=step,
         epoch=epoch,
         metrics=numeric_metrics,
         init_weight_source=init_weight_source,
+        provenance=provenance,
     )
 
 
@@ -236,12 +327,31 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
     run_dir = Path(config.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    dataset_root = Path(config.dataset_root)
+    dataset_source = resolve_dataset_source(
+        dataset_root=config.dataset_root,
+        hf_repo=config.hf_dataset_repo,
+        hf_revision=config.hf_dataset_revision,
+        cache_dir=config.hf_cache_dir,
+    )
+    dataset_root = dataset_source.path
     manifest_path = Path(config.manifest)
     if not manifest_path.is_absolute():
         manifest_path = dataset_root / manifest_path
     device = resolve_device(config.device)
     model, init_weight_source = build_model(config, device)
+    provenance = {
+        "dataset": {
+            **dataset_source.provenance,
+            "manifest_sha256": manifest_sha256(manifest_path),
+        },
+        "init_model": init_weight_source,
+    }
+    tracker = create_tracker(
+        _wandb_config(config),
+        run_config=asdict(config),
+        provenance=provenance,
+    )
+    provenance["wandb"] = tracker.provenance
     mixed_precision = use_mixed_precision(config, device)
     train_dataset = DuixManifestDataset(dataset_root, manifest_path, split="train")
     val_dataset = DuixManifestDataset(dataset_root, manifest_path, split="val")
@@ -271,91 +381,154 @@ def train(config: TrainConfig) -> Path:
     step = 0
     epoch = 0
     active_phase = ""
-    while step < config.max_steps:
-        epoch += 1
-        for batch in train_loader:
-            step += 1
-            phase = phase_for_step(
-                step,
-                max_steps=config.max_steps,
-                warmup_steps=config.warmup_steps,
-                stabilization_steps=config.stabilization_steps,
-            )
-            if phase != active_phase:
-                set_training_phase(model, phase)
-                active_phase = phase
-            learning_rate = config.learning_rate
-            if phase == "stabilization":
-                learning_rate *= config.stabilization_lr_scale
-            for group in optimizer.param_groups:
-                group["lr"] = learning_rate
-            loss = run_train_step(
-                model=model,
-                batch=batch,
-                optimizer=optimizer,
-                device=device,
-                loss_fn=combined_reconstruction_loss,
-                mixed_precision=mixed_precision,
-                scaler=scaler,
-            )
-            row: dict[str, float | int | str] = {
-                "step": step,
-                "epoch": epoch,
-                "phase": phase,
-                "learning_rate": learning_rate,
-                "train_loss": loss,
-            }
-            if step % config.validation_interval == 0:
-                validation = run_validation(
-                    model,
-                    val_loader,
-                    device,
-                    mixed_precision=mixed_precision,
+    try:
+        while step < config.max_steps:
+            epoch += 1
+            for batch in train_loader:
+                step += 1
+                phase = phase_for_step(
+                    step,
+                    max_steps=config.max_steps,
+                    warmup_steps=config.warmup_steps,
+                    stabilization_steps=config.stabilization_steps,
                 )
-                row.update(validation)
-                if validation["val_reconstruction_loss"] < best_val:
-                    best_val = validation["val_reconstruction_loss"]
+                if phase != active_phase:
+                    set_training_phase(model, phase)
+                    active_phase = phase
+                learning_rate = config.learning_rate
+                if phase == "stabilization":
+                    learning_rate *= config.stabilization_lr_scale
+                for group in optimizer.param_groups:
+                    group["lr"] = learning_rate
+                loss = run_train_step(
+                    model=model,
+                    batch=batch,
+                    optimizer=optimizer,
+                    device=device,
+                    loss_fn=combined_reconstruction_loss,
+                    mixed_precision=mixed_precision,
+                    scaler=scaler,
+                )
+                row: dict[str, float | int | str] = {
+                    "step": step,
+                    "epoch": epoch,
+                    "phase": phase,
+                    "learning_rate": learning_rate,
+                    "train_loss": loss,
+                }
+                if step % config.validation_interval == 0:
+                    validation = run_validation(
+                        model,
+                        val_loader,
+                        device,
+                        mixed_precision=mixed_precision,
+                    )
+                    row.update(validation)
+                    if validation["val_reconstruction_loss"] < best_val:
+                        best_val = validation["val_reconstruction_loss"]
+                        atomic_torch_save(
+                            _checkpoint_payload(
+                                model=model,
+                                config=config,
+                                dataset_root=dataset_root,
+                                manifest_path=manifest_path,
+                                step=step,
+                                epoch=epoch,
+                                metrics=row,
+                                init_weight_source=init_weight_source,
+                                provenance=provenance,
+                            ),
+                            best_path,
+                        )
+                if step % config.checkpoint_interval == 0:
                     atomic_torch_save(
                         _checkpoint_payload(
                             model=model,
                             config=config,
+                            dataset_root=dataset_root,
                             manifest_path=manifest_path,
                             step=step,
                             epoch=epoch,
                             metrics=row,
                             init_weight_source=init_weight_source,
+                            provenance=provenance,
                         ),
-                        best_path,
+                        run_dir / f"step_{step:07d}.pt",
                     )
-            if step % config.checkpoint_interval == 0:
-                atomic_torch_save(
-                    _checkpoint_payload(
-                        model=model,
-                        config=config,
-                        manifest_path=manifest_path,
-                        step=step,
-                        epoch=epoch,
-                        metrics=row,
-                        init_weight_source=init_weight_source,
-                    ),
-                    run_dir / f"step_{step:07d}.pt",
-                )
-            metrics.append(row)
-            if step >= config.max_steps:
-                break
+                metrics.append(row)
+                tracker.log_metrics(row, step=step)
+                if step >= config.max_steps:
+                    break
 
-    _write_metrics(metrics, run_dir)
-    if not best_path.exists():
+        _write_metrics(metrics, run_dir)
+        if not best_path.exists():
+            atomic_torch_save(
+                _checkpoint_payload(
+                    model=model,
+                    config=config,
+                    dataset_root=dataset_root,
+                    manifest_path=manifest_path,
+                    step=step,
+                    epoch=epoch,
+                    metrics=metrics[-1],
+                    init_weight_source=init_weight_source,
+                    provenance=provenance,
+                ),
+                best_path,
+            )
+        final_path = run_dir / "final.pt"
         atomic_torch_save(
             _checkpoint_payload(
                 model=model,
                 config=config,
+                dataset_root=dataset_root,
                 manifest_path=manifest_path,
                 step=step,
                 epoch=epoch,
                 metrics=metrics[-1],
                 init_weight_source=init_weight_source,
+                provenance=provenance,
             ),
-            best_path,
+            final_path,
         )
+        write_run_metadata(
+            run_dir,
+            provenance=provenance,
+            best_checkpoint=best_path,
+            final_checkpoint=final_path,
+        )
+        write_model_card(run_dir, provenance=provenance)
+        summary: dict[str, Any] = {
+            "best_checkpoint": str(best_path.resolve()),
+            "final_checkpoint": str(final_path.resolve()),
+        }
+        if best_val != float("inf"):
+            summary["best_val_reconstruction_loss"] = best_val
+        if config.hf_model_repo:
+            model_artifact = push_model_artifacts(
+                run_dir,
+                config.hf_model_repo,
+                private=config.hf_model_private,
+            )
+            provenance["model"] = {
+                "source": "huggingface",
+                "repo_id": model_artifact.repo_id,
+                "resolved_revision": model_artifact.resolved_revision,
+                "url": model_artifact.url,
+            }
+            write_run_metadata(
+                run_dir,
+                provenance=provenance,
+                best_checkpoint=best_path,
+                final_checkpoint=final_path,
+            )
+            write_model_card(run_dir, provenance=provenance)
+            summary["hf_model_repo"] = model_artifact.repo_id
+            summary["hf_model_revision"] = model_artifact.resolved_revision
+            summary["hf_model_url"] = model_artifact.url
+        tracker.update_summary(summary)
+    except Exception:
+        tracker.finish(exit_code=1)
+        raise
+    tracker.finish()
     return best_path
