@@ -4,6 +4,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -36,7 +37,7 @@ def _write_dataset_artifacts(root: Path) -> None:
     (clip / "quality.json").write_text("{}\n", encoding="utf-8")
 
 
-def test_select_hf_video_dataset_files_limits_videos_and_matching_metadata() -> None:
+def test_select_hf_video_dataset_files_limits_videos_without_snapshot_patterns() -> None:
     from edge_lipsync.hf_video_dataset import select_hf_video_dataset_files
 
     selection = select_hf_video_dataset_files(
@@ -52,7 +53,6 @@ def test_select_hf_video_dataset_files_limits_videos_and_matching_metadata() -> 
             "hdtf_landmarks.tar.gz",
         ],
         video_prefix="xdub_teacher_pairs/videos",
-        metadata_prefix="xdub_teacher_pairs/meta",
         max_videos=2,
     )
 
@@ -60,14 +60,7 @@ def test_select_hf_video_dataset_files_limits_videos_and_matching_metadata() -> 
         "xdub_teacher_pairs/videos/a.mp4",
         "xdub_teacher_pairs/videos/b.mp4",
     ]
-    assert selection.allow_patterns == [
-        "README.md",
-        "xdub_teacher_pairs_manifest.json",
-        "xdub_teacher_pairs/videos/a.mp4",
-        "xdub_teacher_pairs/videos/b.mp4",
-        "xdub_teacher_pairs/meta/a.json",
-        "xdub_teacher_pairs/meta/b.json",
-    ]
+    assert not hasattr(selection, "allow_patterns")
 
 
 def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: Path) -> None:
@@ -103,7 +96,7 @@ def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: 
     assert result.selected_video_count == 1
     assert result.raw_video_count == 0
     assert result.pushed_revision is None
-    assert result.snapshot_path is None
+    assert not hasattr(result, "snapshot_path")
     assert api.calls == [
         {
             "repo_id": "Pinch-Research/lipsync-hdtf-training-data",
@@ -115,22 +108,11 @@ def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: 
     assert not (tmp_path / "dataset").exists()
 
 
-def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
+def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
     import edge_lipsync.hf_video_dataset as hf_video_dataset
-
-    snapshot = tmp_path / "snapshot"
-    for relative in (
-        "xdub_teacher_pairs/videos/a.mp4",
-        "xdub_teacher_pairs/videos/b.mp4",
-        "xdub_teacher_pairs/meta/a.json",
-        "xdub_teacher_pairs/meta/b.json",
-    ):
-        path = snapshot / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(relative.encode())
 
     api = _FakeApi(
         [
@@ -141,13 +123,38 @@ def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
             "xdub_teacher_pairs/meta/b.json",
         ]
     )
-    snapshot_calls: list[dict[str, Any]] = []
+    download_calls: list[dict[str, Any]] = []
     build_calls: list[tuple[Any, bool]] = []
     push_calls: list[dict[str, Any]] = []
 
-    def fake_snapshot_download(**kwargs: Any) -> str:
-        snapshot_calls.append(kwargs)
-        return str(snapshot)
+    def fake_download_hf_video_files(
+        repo_id: str,
+        revision: str,
+        video_files: list[str],
+        raw_video_dir: str | Path,
+        *,
+        cache_dir: str,
+        max_workers: int,
+        show_progress: bool,
+    ) -> list[Path]:
+        download_calls.append(
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "video_files": video_files,
+                "raw_video_dir": Path(raw_video_dir),
+                "cache_dir": cache_dir,
+                "max_workers": max_workers,
+                "show_progress": show_progress,
+            }
+        )
+        paths: list[Path] = []
+        for relative in video_files:
+            path = Path(raw_video_dir) / Path(relative).name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode())
+            paths.append(path)
+        return paths
 
     def fake_build_dataset(config: Any, *, strict: bool = False) -> dict[str, int]:
         build_calls.append((config, strict))
@@ -171,7 +178,7 @@ def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
         )
         return _HubArtifact("processed-sha", "https://huggingface.co/datasets/owner/hdtf-duix")
 
-    monkeypatch.setattr(hf_video_dataset, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(hf_video_dataset, "download_hf_video_files", fake_download_hf_video_files)
     monkeypatch.setattr(hf_video_dataset, "build_dataset", fake_build_dataset)
     monkeypatch.setattr(hf_video_dataset, "push_dataset_snapshot", fake_push_dataset_snapshot)
 
@@ -196,18 +203,18 @@ def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
     assert result.selected_video_count == 2
     assert result.raw_video_count == 2
     assert result.pushed_revision == "processed-sha"
-    assert snapshot_calls == [
+    assert download_calls == [
         {
             "repo_id": "Pinch-Research/lipsync-hdtf-training-data",
-            "repo_type": "dataset",
             "revision": "dataset-sha",
-            "allow_patterns": [
-                "README.md",
+            "video_files": [
                 "xdub_teacher_pairs/videos/a.mp4",
                 "xdub_teacher_pairs/videos/b.mp4",
-                "xdub_teacher_pairs/meta/a.json",
-                "xdub_teacher_pairs/meta/b.json",
             ],
+            "raw_video_dir": tmp_path / "work" / "raw_videos",
+            "cache_dir": "",
+            "max_workers": 1,
+            "show_progress": True,
         }
     ]
     raw_video_dir = tmp_path / "work" / "raw_videos"
@@ -226,32 +233,67 @@ def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
     ]
 
 
-def test_prepare_hf_video_raw_dir_reports_progress(
+def test_download_hf_video_files_uses_datasets_loader_and_links_local_paths(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
     import edge_lipsync.hf_video_dataset as hf_video_dataset
 
-    snapshot = tmp_path / "snapshot"
-    for relative in ("videos/a.mp4", "videos/b.mp4"):
-        path = snapshot / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(relative.encode())
-    calls: list[dict[str, object]] = []
+    cached = tmp_path / "cache"
+    source_dir = cached / "source"
+    source_dir.mkdir(parents=True)
+    for name in ("a.mp4", "b.mp4"):
+        (source_dir / name).write_bytes(name.encode())
+    load_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    progress_calls: list[dict[str, object]] = []
+
+    def fake_load_dataset(*args: Any, **kwargs: Any) -> list[dict[str, dict[str, str | None]]]:
+        load_calls.append((args, kwargs))
+        assert hf_video_dataset.datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS == 1
+        return [
+            {"video": {"bytes": None, "path": str(source_dir / "a.mp4")}},
+            {"video": {"bytes": None, "path": str(source_dir / "b.mp4")}},
+        ]
 
     def fake_progress(iterable: object, **kwargs: object) -> object:
-        calls.append(kwargs)
+        progress_calls.append(kwargs)
         return iterable
 
+    monkeypatch.setattr(hf_video_dataset, "load_dataset", fake_load_dataset)
     monkeypatch.setattr(hf_video_dataset, "progress", fake_progress)
-
-    hf_video_dataset.prepare_hf_video_raw_dir(
-        snapshot,
-        ["videos/a.mp4", "videos/b.mp4"],
-        tmp_path / "raw",
+    monkeypatch.setattr(
+        hf_video_dataset.datasets_config,
+        "HF_DATASETS_MULTITHREADING_MAX_WORKERS",
+        8,
     )
 
-    assert calls == [
+    paths = hf_video_dataset.download_hf_video_files(
+        "owner/source-dataset",
+        "dataset-sha",
+        ["videos/a.mp4", "videos/b.mp4"],
+        tmp_path / "raw",
+        cache_dir=str(cached),
+        max_workers=1,
+    )
+
+    assert [path.name for path in paths] == ["a.mp4", "b.mp4"]
+    assert sorted(path.name for path in (tmp_path / "raw").iterdir()) == ["a.mp4", "b.mp4"]
+    assert len(load_calls) == 1
+    args, kwargs = load_calls[0]
+    assert args == ("owner/source-dataset",)
+    assert kwargs["data_files"] == {"train": ["videos/a.mp4", "videos/b.mp4"]}
+    assert kwargs["split"] == "train"
+    assert kwargs["revision"] == "dataset-sha"
+    assert kwargs["cache_dir"] == str(cached)
+    assert kwargs["drop_labels"] is True
+    assert kwargs["drop_metadata"] is True
+    assert kwargs["features"]["video"].decode is False
+    assert kwargs["download_config"].cache_dir == str(cached)
+    assert kwargs["download_config"].resume_download is True
+    assert kwargs["download_config"].max_retries == 5
+    assert kwargs["download_config"].num_proc == 1
+    assert hf_video_dataset.datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS == 8
+    assert progress_calls == [
         {
             "enabled": True,
             "desc": "prepare HF videos",
@@ -282,6 +324,60 @@ def test_build_hf_video_dataset_requires_pinned_revision(tmp_path: Path) -> None
         raise AssertionError("expected pinned revision error")
 
 
+def test_download_hf_video_files_restores_worker_limit_after_loader_error(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import edge_lipsync.hf_video_dataset as hf_video_dataset
+
+    def fake_load_dataset(*_args: Any, **_kwargs: Any) -> object:
+        assert hf_video_dataset.datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS == 1
+        raise RuntimeError("loader failed")
+
+    monkeypatch.setattr(hf_video_dataset, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        hf_video_dataset.datasets_config,
+        "HF_DATASETS_MULTITHREADING_MAX_WORKERS",
+        8,
+    )
+
+    try:
+        hf_video_dataset.download_hf_video_files(
+            "owner/source-dataset",
+            "dataset-sha",
+            ["videos/a.mp4"],
+            tmp_path / "raw",
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "loader failed"
+    else:
+        raise AssertionError("expected loader failure")
+
+    assert hf_video_dataset.datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS == 8
+
+
+def test_build_hf_video_dataset_rejects_non_positive_download_workers(tmp_path: Path) -> None:
+    from edge_lipsync.hf_video_dataset import HfVideoDatasetBuildConfig, build_hf_video_dataset
+
+    api = _FakeApi([])
+
+    try:
+        build_hf_video_dataset(
+            HfVideoDatasetBuildConfig(
+                repo_id="Pinch-Research/lipsync-hdtf-training-data",
+                revision="dataset-sha",
+                dataset_root=str(tmp_path / "dataset"),
+                wenet_onnx="models/wenet/wenet.onnx",
+                download_max_workers=0,
+            ),
+            api=api,
+        )
+    except ValueError as exc:
+        assert "download_max_workers" in str(exc)
+    else:
+        raise AssertionError("expected download_max_workers error")
+
+
 def test_build_hf_video_dataset_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/build_hf_video_dataset.py", "--help"],
@@ -294,5 +390,55 @@ def test_build_hf_video_dataset_cli_help() -> None:
     assert "--repo-id" in result.stdout
     assert "--video-prefix" in result.stdout
     assert "--max-videos" in result.stdout
+    assert "--download-max-workers" in result.stdout
+    assert "--download-request-interval-seconds" not in result.stdout
     assert "--dry-run" in result.stdout
     assert "--no-progress" in result.stdout
+
+
+def test_build_hf_video_dataset_cli_passes_download_max_workers(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import tools.build_hf_video_dataset as cli
+
+    configs: list[Any] = []
+
+    def fake_build_hf_video_dataset(config: Any) -> SimpleNamespace:
+        configs.append(config)
+        return SimpleNamespace(
+            dry_run=True,
+            repo_id=config.repo_id,
+            requested_revision=config.revision,
+            dataset_root=Path(config.dataset_root),
+            work_dir=tmp_path / "work",
+            raw_video_dir=tmp_path / "work" / "raw_videos",
+            selected_video_count=1,
+            raw_video_count=0,
+            pushed_revision=None,
+            hub_url=None,
+        )
+
+    monkeypatch.setattr(cli, "build_hf_video_dataset", fake_build_hf_video_dataset)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "build_hf_video_dataset.py",
+            "--repo-id",
+            "Pinch-Research/lipsync-hdtf-training-data",
+            "--revision",
+            "dataset-sha",
+            "--dataset-root",
+            str(tmp_path / "dataset"),
+            "--wenet-onnx",
+            "models/wenet/wenet.onnx",
+            "--download-max-workers",
+            "3",
+            "--dry-run",
+        ],
+    )
+
+    cli.main()
+
+    assert configs[0].download_max_workers == 3

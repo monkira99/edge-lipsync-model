@@ -9,6 +9,7 @@ description = "Edge-oriented Duix UNet fine-tuning and evaluation pipeline"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "datasets>=4.8.5",
   "huggingface-hub>=1.17.0",
   "numpy>=1.26",
   "opencv-python>=4.8",

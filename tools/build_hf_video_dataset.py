@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from edge_lipsync.hf_video_dataset import (  # noqa: E402
-    DEFAULT_METADATA_PREFIX,
     DEFAULT_VIDEO_PREFIX,
     HfVideoDatasetBuildConfig,
     build_hf_video_dataset,
@@ -25,8 +24,13 @@ def main() -> None:
     parser.add_argument("--dataset-root", required=True, help="Output processed dataset directory")
     parser.add_argument("--work-dir", default="", help="Intermediate work directory")
     parser.add_argument("--cache-dir", default="", help="Hugging Face cache directory")
+    parser.add_argument(
+        "--download-max-workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent datasets file downloads. Keep at 1 to avoid rate limits.",
+    )
     parser.add_argument("--video-prefix", default=DEFAULT_VIDEO_PREFIX)
-    parser.add_argument("--metadata-prefix", default=DEFAULT_METADATA_PREFIX)
     parser.add_argument(
         "--max-videos",
         type=int,
@@ -84,8 +88,8 @@ def main() -> None:
             dataset_root=args.dataset_root,
             work_dir=args.work_dir,
             cache_dir=args.cache_dir,
+            download_max_workers=args.download_max_workers,
             video_prefix=args.video_prefix,
-            metadata_prefix=args.metadata_prefix,
             max_videos=args.max_videos,
             wenet_onnx=args.wenet_onnx,
             landmark_model_asset_path=args.landmark_model_asset_path,
@@ -112,8 +116,6 @@ def main() -> None:
     print(f"raw_video_dir={result.raw_video_dir.resolve()}")
     print(f"selected_video_count={result.selected_video_count}")
     print(f"raw_video_count={result.raw_video_count}")
-    if result.snapshot_path is not None:
-        print(f"snapshot_path={result.snapshot_path.resolve()}")
     if result.pushed_revision is not None:
         print(f"processed_revision={result.pushed_revision}")
     if result.hub_url is not None:

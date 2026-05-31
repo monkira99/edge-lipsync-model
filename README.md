@@ -107,7 +107,12 @@ progress bars in CI logs.
 Use `tools/build_hf_video_dataset.py` for HF datasets that already contain synced MP4 clips. This
 fits `Pinch-Research/lipsync-hdtf-training-data` because the teacher videos live under
 `xdub_teacher_pairs/videos/` and already include muxed audio. Use a pinned dataset revision and
-start with `--dry-run` plus `--max-videos`.
+start with `--dry-run` plus `--max-videos`. The adapter downloads only selected videos, one file at
+a time through Hugging Face `datasets.load_dataset()` instead of building a Hub snapshot. Video
+decoding stays disabled while the adapter links the cached local MP4 paths into its work directory.
+The datasets downloader is limited to one worker by default; adjust `--download-max-workers` only
+when the Hub endpoint can handle additional concurrency. Authenticate with `HF_TOKEN` before large
+downloads so the Hub does not apply the lower anonymous resolver quota.
 
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
@@ -118,7 +123,7 @@ start with `--dry-run` plus `--max-videos`.
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
   --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
   --video-prefix xdub_teacher_pairs/videos \
-  --metadata-prefix xdub_teacher_pairs/meta \
+  --download-max-workers 1 \
   --max-videos 20 \
   --dry-run
 ```
@@ -134,6 +139,7 @@ dataset snapshot after the build:
   --work-dir /absolute/path/to/work/hdtf_xdub \
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
   --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --download-max-workers 1 \
   --max-videos 20 \
   --push \
   --hf-output-repo-id username/hdtf-xdub-duix-dataset

@@ -2,23 +2,33 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from datasets import (
+    DownloadConfig,
+    Features,
+    Video,
+    load_dataset,
+)
+from datasets import (
+    config as datasets_config,
+)
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset
-from edge_lipsync.hub import HfApi, push_dataset_snapshot, snapshot_download
+from edge_lipsync.hub import HfApi, push_dataset_snapshot
 from edge_lipsync.progress import progress
 
 DEFAULT_VIDEO_PREFIX = "xdub_teacher_pairs/videos"
-DEFAULT_METADATA_PREFIX = "xdub_teacher_pairs/meta"
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".avi", ".mpeg", ".mpg")
 
 
 @dataclass(frozen=True)
 class HfVideoFileSelection:
     video_files: list[str]
-    allow_patterns: list[str]
 
 
 @dataclass(frozen=True)
@@ -28,9 +38,9 @@ class HfVideoDatasetBuildConfig:
     dataset_root: str
     wenet_onnx: str
     video_prefix: str = DEFAULT_VIDEO_PREFIX
-    metadata_prefix: str = DEFAULT_METADATA_PREFIX
     work_dir: str = ""
     cache_dir: str = ""
+    download_max_workers: int = 1
     max_videos: int = 0
     fps: int = 25
     sample_rate: int = 16000
@@ -69,8 +79,6 @@ class HfVideoDatasetBuildResult:
     raw_video_count: int
     dry_run: bool
     selected_video_files: list[str]
-    allow_patterns: list[str]
-    snapshot_path: Path | None = None
     pushed_revision: str | None = None
     hub_url: str | None = None
     build_summary: dict[str, Any] | None = None
@@ -97,13 +105,11 @@ def select_hf_video_dataset_files(
     repo_files: list[str],
     *,
     video_prefix: str = DEFAULT_VIDEO_PREFIX,
-    metadata_prefix: str = DEFAULT_METADATA_PREFIX,
     max_videos: int = 0,
 ) -> HfVideoFileSelection:
     if max_videos < 0:
         raise ValueError("max_videos must be >= 0")
     video_root = _normalized_prefix(video_prefix)
-    metadata_root = _normalized_prefix(metadata_prefix)
     video_files = sorted(
         file_path
         for file_path in repo_files
@@ -111,19 +117,7 @@ def select_hf_video_dataset_files(
     )
     if max_videos:
         video_files = video_files[:max_videos]
-
-    repo_file_set = set(repo_files)
-    allow_patterns: list[str] = []
-    for optional in ("README.md", "xdub_teacher_pairs_manifest.json"):
-        if optional in repo_file_set:
-            allow_patterns.append(optional)
-    allow_patterns.extend(video_files)
-    if metadata_root:
-        for video_file in video_files:
-            metadata_file = f"{metadata_root}/{Path(video_file).stem}.json"
-            if metadata_file in repo_file_set:
-                allow_patterns.append(metadata_file)
-    return HfVideoFileSelection(video_files=video_files, allow_patterns=allow_patterns)
+    return HfVideoFileSelection(video_files=video_files)
 
 
 def _default_work_dir(dataset_root: Path) -> Path:
@@ -140,31 +134,69 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def prepare_hf_video_raw_dir(
-    snapshot_path: str | Path,
+@contextmanager
+def _limited_datasets_download_workers(max_workers: int) -> Iterator[None]:
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+    previous = datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS
+    datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS = max_workers
+    try:
+        yield
+    finally:
+        datasets_config.HF_DATASETS_MULTITHREADING_MAX_WORKERS = previous
+
+
+def download_hf_video_files(
+    repo_id: str,
+    revision: str,
     video_files: list[str],
     raw_video_dir: str | Path,
     *,
+    cache_dir: str = "",
+    max_workers: int = 1,
     show_progress: bool = True,
 ) -> list[Path]:
-    snapshot_root = Path(snapshot_path)
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
     out_dir = Path(raw_video_dir)
+    names = [Path(relative).name for relative in video_files]
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate raw video filename after flattening")
+
+    download_config = DownloadConfig(
+        cache_dir=cache_dir or None,
+        resume_download=True,
+        max_retries=5,
+        num_proc=1,
+    )
+    with _limited_datasets_download_workers(max_workers):
+        dataset = load_dataset(
+            repo_id,
+            data_files={"train": video_files},
+            split="train",
+            revision=revision,
+            cache_dir=cache_dir or None,
+            features=Features({"video": Video(decode=False)}),
+            download_config=download_config,
+            drop_labels=True,
+            drop_metadata=True,
+        )
+
     prepared: list[Path] = []
-    seen: set[str] = set()
-    for relative in progress(
-        video_files,
+    for row in progress(
+        dataset,
         enabled=show_progress,
         desc="prepare HF videos",
         total=len(video_files),
         unit="clip",
     ):
-        src = snapshot_root / relative
+        video = cast(dict[str, Any], row)["video"]
+        if not isinstance(video, dict) or not isinstance(video.get("path"), str):
+            raise ValueError(f"Expected a local video path from datasets, got: {video!r}")
+        src = Path(video["path"])
         if not src.is_file():
             raise FileNotFoundError(src)
-        name = Path(relative).name
-        if name in seen:
-            raise ValueError(f"Duplicate raw video filename after flattening: {name}")
-        seen.add(name)
+        name = src.name
         dst = out_dir / name
         _link_or_copy(src, dst)
         prepared.append(dst)
@@ -203,6 +235,8 @@ def build_hf_video_dataset(
     api: Any | None = None,
 ) -> HfVideoDatasetBuildResult:
     _require_revision(config.revision)
+    if config.download_max_workers < 1:
+        raise ValueError("download_max_workers must be >= 1")
     if config.push and not config.dry_run and not config.hf_output_repo_id:
         raise ValueError("hf_output_repo_id is required when push=True")
     dataset_root = Path(config.dataset_root)
@@ -217,7 +251,6 @@ def build_hf_video_dataset(
     selection = select_hf_video_dataset_files(
         list(repo_files),
         video_prefix=config.video_prefix,
-        metadata_prefix=config.metadata_prefix,
         max_videos=config.max_videos,
     )
     if not selection.video_files:
@@ -236,22 +269,15 @@ def build_hf_video_dataset(
             raw_video_count=0,
             dry_run=True,
             selected_video_files=selection.video_files,
-            allow_patterns=selection.allow_patterns,
         )
 
-    download_kwargs: dict[str, Any] = {
-        "repo_id": config.repo_id,
-        "repo_type": "dataset",
-        "revision": config.revision,
-        "allow_patterns": selection.allow_patterns,
-    }
-    if config.cache_dir:
-        download_kwargs["cache_dir"] = config.cache_dir
-    snapshot_path = Path(snapshot_download(**download_kwargs))
-    raw_video_paths = prepare_hf_video_raw_dir(
-        snapshot_path,
+    raw_video_paths = download_hf_video_files(
+        config.repo_id,
+        config.revision,
         selection.video_files,
         raw_video_dir,
+        cache_dir=config.cache_dir,
+        max_workers=config.download_max_workers,
         show_progress=config.progress,
     )
     build_summary = build_dataset(
@@ -280,8 +306,6 @@ def build_hf_video_dataset(
         raw_video_count=len(raw_video_paths),
         dry_run=False,
         selected_video_files=selection.video_files,
-        allow_patterns=selection.allow_patterns,
-        snapshot_path=snapshot_path,
         pushed_revision=pushed_revision,
         hub_url=hub_url,
         build_summary=build_summary,
