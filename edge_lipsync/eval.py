@@ -83,7 +83,7 @@ def write_rgb_video(
     out.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(out),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        cv2.VideoWriter_fourcc(*"mp4v"),  # pyright: ignore[reportAttributeAccessIssue]
         float(fps),
         (width, height),
     )

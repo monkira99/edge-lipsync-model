@@ -17,13 +17,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=8.0",
-  "ruff>=0.5",
-]
+dev = ["pytest>=8.0", "ruff>=0.5", "pyright[dev]>=1.1.409"]
 
 [tool.setuptools.packages.find]
 include = ["edge_lipsync*"]
+
+[tool.pyright]
+include = ["edge_lipsync", "tools", "tests"]
+exclude = ["**/__pycache__", ".venv"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+reportPrivateImportUsage = "none"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,11 @@ from edge_lipsync.audio_features import (
 from edge_lipsync.preprocess import make_face_training_sample
 
 BBox = tuple[int, int, int, int]
+
+
+def _rounded_bbox(values: Iterable[float]) -> BBox:
+    x1, y1, x2, y2 = values
+    return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
 
 
 @dataclass(frozen=True)
@@ -134,7 +140,7 @@ def extract_frames(video_path: Path, frames_dir: Path) -> int:
 
 def detect_largest_face(frame_bgr: np.ndarray) -> BBox | None:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"  # pyright: ignore[reportAttributeAccessIssue]
     detector = cv2.CascadeClassifier(cascade_path)
     faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
     if len(faces) == 0:
@@ -200,8 +206,8 @@ def interpolate_short_bbox_gaps(
             continue
         for offset, frame_index in enumerate(gap_indices, start=1):
             fraction = offset / (len(gap_indices) + 1)
-            out[frame_index] = tuple(
-                int(round(left[value_index] + (right[value_index] - left[value_index]) * fraction))
+            out[frame_index] = _rounded_bbox(
+                left[value_index] + (right[value_index] - left[value_index]) * fraction
                 for value_index in range(4)
             )
             flags[frame_index] = ["interpolated_bbox"]
@@ -220,13 +226,13 @@ def smooth_bboxes(boxes: dict[int, BBox], *, radius: int = 2) -> dict[int, BBox]
             if abs(neighbor_index - frame_index) <= radius
         ]
         values = np.asarray(neighbors, dtype=np.float32)
-        out[frame_index] = tuple(int(round(value)) for value in values.mean(axis=0))
+        out[frame_index] = _rounded_bbox(values.mean(axis=0))
     return out
 
 
 def clean_bboxes(
-    boxes: dict[int, BBox | None],
-    frame_shapes: dict[int, tuple[int, ...]],
+    boxes: Mapping[int, BBox | None],
+    frame_shapes: Mapping[int, tuple[int, ...]],
     *,
     gates: BBoxGates,
     max_missing_gap: int,

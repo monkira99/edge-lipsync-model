@@ -4,7 +4,7 @@ import math
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import numpy as np
 import onnxruntime as ort
@@ -81,9 +81,10 @@ def hz_to_mel(freq: np.ndarray | float) -> np.ndarray | float:
     min_log_mel = (min_log_hz - f_min) / f_sp
     logstep = math.log(6.4) / 27.0
     if np.isscalar(freq):
-        mel = (freq - f_min) / f_sp
-        if freq >= min_log_hz:
-            mel = min_log_mel + math.log(freq / min_log_hz) / logstep
+        scalar_freq = cast(float, freq)
+        mel = (scalar_freq - f_min) / f_sp
+        if scalar_freq >= min_log_hz:
+            mel = min_log_mel + math.log(scalar_freq / min_log_hz) / logstep
         return mel
     freqs = np.asarray(freq, dtype=np.float64)
     mels = (freqs - f_min) / f_sp
@@ -272,4 +273,4 @@ def build_bnf_windows_from_audio(audio: np.ndarray, session: WenetSession) -> np
 def extract_bnf_windows_from_wav(wav_path: str | Path, wenet_onnx: str | Path) -> np.ndarray:
     audio = load_wav_mono_f32(wav_path)
     session = ort.InferenceSession(str(wenet_onnx), providers=["CPUExecutionProvider"])
-    return build_bnf_windows_from_audio(audio, session)
+    return build_bnf_windows_from_audio(audio, cast(WenetSession, session))

@@ -90,7 +90,7 @@ class ConvBlock(nn.Module):
                 stride=(sh, sw),
                 padding=(ph, pw),
                 output_padding=(oph, opw),
-                dilation=(dh, dw),
+                dilation=(dh, dw),  # pyright: ignore[reportArgumentType]
                 groups=groups,
                 bias=bias,
             )
@@ -518,15 +518,17 @@ class DuixUNet(nn.Module):
             for op, name in WEIGHT_ORDER:
                 mod = self._name_to_module[name]
                 if op in ('Convolution', 'ConvolutionDepthWise', 'Deconvolution'):
-                    if not hasattr(mod, 'weight'):
-                        raise TypeError(f'Layer {name} has no weight tensor')
-                    weight = mod.weight  # type: ignore[attr-defined]
+                    if not isinstance(mod, (nn.Conv2d, nn.ConvTranspose2d)):
+                        raise TypeError(f'Expected convolution for {name}, got {type(mod)}')
+                    weight = mod.weight
                     w_flat = reader.read_blob(weight.numel())
                     if op == 'Deconvolution':
-                        in_ch = mod.in_channels  # type: ignore[attr-defined]
-                        out_ch = mod.out_channels  # type: ignore[attr-defined]
-                        groups = mod.groups  # type: ignore[attr-defined]
-                        kh, kw = mod.kernel_size  # type: ignore[attr-defined]
+                        if not isinstance(mod, nn.ConvTranspose2d):
+                            raise TypeError(f'Expected ConvTranspose2d for {name}, got {type(mod)}')
+                        in_ch = mod.in_channels
+                        out_ch = mod.out_channels
+                        groups = mod.groups
+                        kh, kw = mod.kernel_size
                         in_g = in_ch // groups
                         out_g = out_ch // groups
                         w = w_flat.view(groups, out_g, in_g, kh, kw).permute(0, 2, 1, 3, 4).contiguous()

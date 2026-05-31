@@ -17,6 +17,14 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
+## Verify
+
+```bash
+.venv/bin/pyright
+.venv/bin/ruff check .
+.venv/bin/pytest -q
+```
+
 ## Export Initial Checkpoint
 
 ```bash

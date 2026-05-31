@@ -41,12 +41,13 @@ class ManifestRecord:
         split = str(payload["split"])
         if split not in {"train", "val"}:
             raise ValueError(f"split must be train or val: {split}")
+        x1, y1, x2, y2 = bbox
         return ManifestRecord(
             clip_id=str(payload["clip_id"]),
             frame_idx=int(payload["frame_idx"]),
             audio_idx=int(payload["audio_idx"]),
             frame_path=_require_relative_path(payload["frame_path"], "frame_path"),
-            bbox_xyxy=tuple(int(value) for value in bbox),
+            bbox_xyxy=(int(x1), int(y1), int(x2), int(y2)),
             bnf_path=_require_relative_path(payload["bnf_path"], "bnf_path"),
             split=split,
             flags=tuple(str(value) for value in payload.get("flags", [])),
