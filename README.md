@@ -72,6 +72,40 @@ The default bbox detector is `mediapipe_face_landmarker`, which derives the Duix
 from face landmarks. `haar` remains available only as a debug fallback and produces full-face
 boxes, not production Duix ROI boxes.
 
+## Build GRID Baseline Dataset
+
+Use the GRID adapter to create a small baseline dataset from an extracted GRID corpus, then push
+the processed Duix dataset to Hugging Face after inspecting the previews. Start with `--dry-run`
+or a small `--max-videos` value; do not run the full corpus locally until the small build is
+validated.
+
+```bash
+.venv/bin/python tools/build_grid_hf_dataset.py \
+  --grid-root /absolute/path/to/grid \
+  --dataset-root /absolute/path/to/data/grid_duix_dataset \
+  --work-dir /absolute/path/to/work/grid_duix \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --speaker s1 \
+  --max-videos 20 \
+  --dry-run
+```
+
+When the dry run and a small local build look correct, run without `--dry-run` and add `--push`:
+
+```bash
+.venv/bin/python tools/build_grid_hf_dataset.py \
+  --grid-root /absolute/path/to/grid \
+  --dataset-root /absolute/path/to/data/grid_duix_dataset \
+  --work-dir /absolute/path/to/work/grid_duix \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --speaker s1 \
+  --max-videos 20 \
+  --push \
+  --hf-repo-id username/grid-duix-baseline
+```
+
 ## Version Processed Datasets On Hugging Face
 
 Upload a built dataset after inspecting its `build_summary.json` and previews:
