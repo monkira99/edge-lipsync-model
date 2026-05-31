@@ -1,0 +1,40 @@
+from __future__ import annotations
+
+import torch
+
+
+def test_charbonnier_loss_backward() -> None:
+    from edge_lipsync.losses import charbonnier_loss
+
+    pred = torch.zeros(2, 3, 160, 160, requires_grad=True)
+    target = torch.ones(2, 3, 160, 160)
+    loss = charbonnier_loss(pred, target)
+    loss.backward()
+
+    assert loss.item() > 0
+    assert pred.grad is not None
+
+
+def test_mouth_weighted_loss_is_larger_for_mouth_error() -> None:
+    from edge_lipsync.losses import mouth_weighted_l1
+
+    pred = torch.zeros(1, 3, 160, 160)
+    target = torch.zeros(1, 3, 160, 160)
+    target[:, :, 20:120, 20:120] = 1.0
+
+    weighted = mouth_weighted_l1(pred, target, mouth_weight=4.0)
+    plain = torch.nn.functional.l1_loss(pred, target)
+
+    assert weighted.item() > plain.item()
+
+
+def test_mouth_weight_mask_matches_duix_mask_rectangle() -> None:
+    from edge_lipsync.losses import mouth_weight_mask
+
+    mask = mouth_weight_mask(torch.device("cpu"), torch.float32, mouth_weight=4.0)
+
+    assert tuple(mask.shape) == (1, 1, 160, 160)
+    assert mask[0, 0, 4, 4] == 1.0
+    assert mask[0, 0, 5, 5] == 4.0
+    assert mask[0, 0, 149, 154] == 4.0
+    assert mask[0, 0, 150, 155] == 1.0
