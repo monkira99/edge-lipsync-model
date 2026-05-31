@@ -17,6 +17,74 @@ def test_validate_stream_payload_requires_audio_and_video() -> None:
         validate_stream_payload({"streams": [{"codec_type": "video"}]})
 
 
+def test_dataset_build_defaults_to_duix_roi_smoothing_radius() -> None:
+    from edge_lipsync.build_dataset import DatasetBuildConfig
+
+    config = DatasetBuildConfig(raw_video_dir="raw", dataset_root="dataset", wenet_onnx="wenet")
+
+    assert config.bbox_smooth_radius == 1
+
+
+def test_extract_frames_writes_lossless_png(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    frame = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+
+    class FakeCapture:
+        def __init__(self, _path: str) -> None:
+            self._frames = [frame]
+
+        def isOpened(self) -> bool:
+            return True
+
+        def read(self) -> tuple[bool, np.ndarray | None]:
+            if self._frames:
+                return True, self._frames.pop()
+            return False, None
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(builder.cv2, "VideoCapture", FakeCapture)
+
+    count = builder.extract_frames(tmp_path / "video.mkv", tmp_path / "frames")
+
+    extracted = cv2.imread(str(tmp_path / "frames/000001.png"), cv2.IMREAD_COLOR)
+    assert count == 1
+    assert extracted is not None
+    assert np.array_equal(extracted, frame)
+
+
+def test_normalize_clip_preserves_source_sample_rate_for_python_resampling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(builder, "require_tool", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        builder,
+        "run",
+        lambda command: commands.append(command)
+        or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    builder.normalize_clip(
+        tmp_path / "input.mkv",
+        tmp_path / "normalized",
+        fps=25,
+        sample_rate=16000,
+    )
+
+    audio_command = commands[1]
+    assert "-ar" not in audio_command
+    assert audio_command[audio_command.index("-acodec") + 1] == "pcm_s16le"
+
+
 def test_interpolate_short_bbox_gaps_preserves_long_gaps() -> None:
     from edge_lipsync.build_dataset import interpolate_short_bbox_gaps
 
@@ -135,7 +203,7 @@ def test_write_manifest_creates_relative_records_and_splits(tmp_path: Path) -> N
     ]
 
     assert len(rows) == 4
-    assert rows[0]["frame_path"] == "clips/a/frames/000001.jpg"
+    assert rows[0]["frame_path"] == "clips/a/frames/000001.png"
     assert rows[1]["flags"] == ["interpolated_bbox"]
     assert {row["split"] for row in rows} == {"train", "val"}
     assert split_counts == {"train": 2, "val": 2}
@@ -172,7 +240,7 @@ def test_process_clip_uses_landmark_roi_not_raw_face_detector(
     def fake_extract_frames(_video_path: Path, frames_dir: Path) -> int:
         frames_dir.mkdir(parents=True, exist_ok=True)
         frame = np.full((960, 540, 3), 120, dtype=np.uint8)
-        cv2.imwrite(str(frames_dir / "000001.jpg"), frame)
+        cv2.imwrite(str(frames_dir / "000001.png"), frame)
         return 1
 
     def fake_normalize_clip(

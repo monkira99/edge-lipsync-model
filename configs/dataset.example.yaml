@@ -15,6 +15,6 @@ min_bbox_size: 32
 max_bbox_frame_fraction: 0.9
 max_bbox_jump_fraction: 0.25
 max_missing_gap: 3
-bbox_smooth_radius: 2
+bbox_smooth_radius: 1
 silence_rms_threshold: 0.001
 max_silence_fraction: 0.25

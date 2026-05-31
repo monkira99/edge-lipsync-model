@@ -29,8 +29,9 @@ FACE_MESH_MOUTH_RIGHT = 291
 FACE_MESH_UPPER_LIP = 13
 FACE_MESH_LOWER_LIP = 14
 
-DUIX_ROI_TOP_FROM_EYE_TO_CHIN = 0.125
-DUIX_ROI_LOWER_HEIGHT_SCALE = 1.12
+DUIX_ROI_TOP_FROM_EYE_TO_CHIN = 0.096
+DUIX_ROI_CHEEK_WIDTH_SCALE = 1.056
+DUIX_ROI_CENTER_X_OFFSET = -1.0
 
 
 @dataclass(frozen=True)
@@ -99,24 +100,8 @@ def landmarks_to_duix_roi(
     cheek_center = _mean_point([left_cheek, right_cheek])
     face_width = math.dist(left_cheek, right_cheek)
     roi_top = eye_center[1] + (chin[1] - eye_center[1]) * DUIX_ROI_TOP_FROM_EYE_TO_CHIN
-    lower_face_height = max(1.0, chin[1] - roi_top)
-
-    center_points = [cheek_center]
-    for index in (
-        FACE_MESH_NOSE_TIP,
-        FACE_MESH_MOUTH_LEFT,
-        FACE_MESH_MOUTH_RIGHT,
-        FACE_MESH_UPPER_LIP,
-        FACE_MESH_LOWER_LIP,
-    ):
-        try:
-            center_points.append(_landmark_xy(landmarks_xy, index))
-        except (KeyError, IndexError):
-            continue
-    center = _mean_point(center_points)
-
-    side = max(float(min_size), face_width, lower_face_height * DUIX_ROI_LOWER_HEIGHT_SCALE)
-    return _clip_square_bbox(center[0], roi_top, side, frame_shape)
+    side = max(float(min_size), face_width * DUIX_ROI_CHEEK_WIDTH_SCALE)
+    return _clip_square_bbox(cheek_center[0] + DUIX_ROI_CENTER_X_OFFSET, roi_top, side, frame_shape)
 
 
 def adjust_bbox(

@@ -22,6 +22,7 @@ from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
 from edge_lipsync.preprocess import make_face_training_sample
 
 BBox = tuple[int, int, int, int]
+FRAME_SUFFIX = ".png"
 SUPPORTED_BBOX_DETECTORS = {"mediapipe_face_landmarker", "mediapipe_face_mesh", "haar"}
 
 
@@ -56,7 +57,7 @@ class DatasetBuildConfig:
     max_bbox_frame_fraction: float = 0.9
     max_bbox_jump_fraction: float = 0.25
     max_missing_gap: int = 3
-    bbox_smooth_radius: int = 2
+    bbox_smooth_radius: int = 1
     silence_rms_threshold: float = 1e-3
     max_silence_fraction: float = 0.25
 
@@ -104,9 +105,26 @@ def probe_clip(path: Path) -> dict[str, Any]:
 def normalize_clip(src: Path, out_dir: Path, fps: int, sample_rate: int) -> tuple[Path, Path]:
     ffmpeg = require_tool("ffmpeg")
     out_dir.mkdir(parents=True, exist_ok=True)
-    video_out = out_dir / "video_25fps.mp4"
+    video_out = out_dir / "video_25fps.mkv"
     audio_out = out_dir / "audio.wav"
-    run([ffmpeg, "-y", "-i", str(src), "-vf", f"fps={fps}", "-an", str(video_out)])
+    run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(src),
+            "-vf",
+            f"fps={fps}",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "bgr0",
+            str(video_out),
+        ]
+    )
     run(
         [
             ffmpeg,
@@ -115,8 +133,6 @@ def normalize_clip(src: Path, out_dir: Path, fps: int, sample_rate: int) -> tupl
             str(src),
             "-ac",
             "1",
-            "-ar",
-            str(sample_rate),
             "-acodec",
             "pcm_s16le",
             str(audio_out),
@@ -136,7 +152,7 @@ def extract_frames(video_path: Path, frames_dir: Path) -> int:
         if not ok:
             break
         count += 1
-        if not cv2.imwrite(str(frames_dir / f"{count:06d}.jpg"), frame):
+        if not cv2.imwrite(str(frames_dir / f"{count:06d}{FRAME_SUFFIX}"), frame):
             raise RuntimeError(f"Cannot write extracted frame {count} from {video_path}")
     capture.release()
     if count == 0:
@@ -360,7 +376,7 @@ def write_manifest(
                     "clip_id": clip_id,
                     "frame_idx": frame_idx,
                     "audio_idx": frame_idx - 1,
-                    "frame_path": f"clips/{clip_id}/frames/{frame_idx:06d}.jpg",
+                    "frame_path": f"clips/{clip_id}/frames/{frame_idx:06d}{FRAME_SUFFIX}",
                     "bbox_xyxy": [int(value) for value in boxes[frame_idx]],
                     "bnf_path": f"clips/{clip_id}/bnf.npy",
                     "split": split,
@@ -429,7 +445,10 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
     frame_shapes: dict[int, tuple[int, ...]] = {}
     try:
         for frame_idx in range(1, frame_count + 1):
-            frame = cv2.imread(str(frames_dir / f"{frame_idx:06d}.jpg"), cv2.IMREAD_COLOR)
+            frame = cv2.imread(
+                str(frames_dir / f"{frame_idx:06d}{FRAME_SUFFIX}"),
+                cv2.IMREAD_COLOR,
+            )
             if frame is None:
                 raise RuntimeError(f"Cannot read extracted frame {frame_idx} for {clip_id}")
             frame_shapes[frame_idx] = frame.shape
@@ -469,7 +488,10 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
         encoding="utf-8",
     )
     for frame_idx in _select_preview_indices(valid_frames, config.preview_count):
-        frame = cv2.imread(str(frames_dir / f"{frame_idx:06d}.jpg"), cv2.IMREAD_COLOR)
+        frame = cv2.imread(
+            str(frames_dir / f"{frame_idx:06d}{FRAME_SUFFIX}"),
+            cv2.IMREAD_COLOR,
+        )
         if frame is not None:
             write_preview(frame, boxes[frame_idx], clip_dir / "previews", frame_idx=frame_idx)
     quality = {

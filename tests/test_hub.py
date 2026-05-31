@@ -47,12 +47,12 @@ def _write_dataset_root(root: Path) -> Path:
     (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
     (dataset_root / "splits.json").write_text("{}\n", encoding="utf-8")
     (dataset_root / "build_summary.json").write_text("{}\n", encoding="utf-8")
-    (frames / "000001.jpg").write_bytes(b"jpg")
+    (frames / "000001.png").write_bytes(b"png")
     (clip / "bnf.npy").write_bytes(b"npy")
     (clip / "bboxes.json").write_text("{}\n", encoding="utf-8")
     (clip / "quality.json").write_text("{}\n", encoding="utf-8")
     (clip / "audio.wav").write_bytes(b"excluded")
-    (clip / "video_25fps.mp4").write_bytes(b"excluded")
+    (clip / "video_25fps.mkv").write_bytes(b"excluded")
     return dataset_root
 
 

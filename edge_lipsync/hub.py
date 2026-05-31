@@ -29,7 +29,7 @@ DATASET_UPLOAD_PATTERNS = (
     "manifest.jsonl",
     "splits.json",
     "build_summary.json",
-    "clips/*/frames/*.jpg",
+    "clips/*/frames/*.png",
     "clips/*/bnf.npy",
     "clips/*/bboxes.json",
     "clips/*/quality.json",
