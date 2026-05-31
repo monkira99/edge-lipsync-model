@@ -98,6 +98,9 @@ dataset build does not add avoidable image degradation before preprocessing.
 The default bbox detector is `mediapipe_face_landmarker`, which derives the Duix lower-face ROI
 from face landmarks. `haar` remains available only as a debug fallback and produces full-face
 boxes, not production Duix ROI boxes.
+Dataset processing commands use `tqdm.auto` progress bars for terminal and notebook contexts.
+Pass `--no-progress` on the data build CLIs, or set `progress: false` in YAML configs, to disable
+progress bars in CI logs.
 
 ## Build Hugging Face Video Dataset
 

@@ -226,6 +226,41 @@ def test_build_hf_video_dataset_downloads_subset_builds_and_pushes(
     ]
 
 
+def test_prepare_hf_video_raw_dir_reports_progress(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import edge_lipsync.hf_video_dataset as hf_video_dataset
+
+    snapshot = tmp_path / "snapshot"
+    for relative in ("videos/a.mp4", "videos/b.mp4"):
+        path = snapshot / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(relative.encode())
+    calls: list[dict[str, object]] = []
+
+    def fake_progress(iterable: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(hf_video_dataset, "progress", fake_progress)
+
+    hf_video_dataset.prepare_hf_video_raw_dir(
+        snapshot,
+        ["videos/a.mp4", "videos/b.mp4"],
+        tmp_path / "raw",
+    )
+
+    assert calls == [
+        {
+            "enabled": True,
+            "desc": "prepare HF videos",
+            "total": 2,
+            "unit": "clip",
+        }
+    ]
+
+
 def test_build_hf_video_dataset_requires_pinned_revision(tmp_path: Path) -> None:
     from edge_lipsync.hf_video_dataset import HfVideoDatasetBuildConfig, build_hf_video_dataset
 
@@ -260,3 +295,4 @@ def test_build_hf_video_dataset_cli_help() -> None:
     assert "--video-prefix" in result.stdout
     assert "--max-videos" in result.stdout
     assert "--dry-run" in result.stdout
+    assert "--no-progress" in result.stdout

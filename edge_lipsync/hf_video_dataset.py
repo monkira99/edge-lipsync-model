@@ -8,6 +8,7 @@ from typing import Any
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset
 from edge_lipsync.hub import HfApi, push_dataset_snapshot, snapshot_download
+from edge_lipsync.progress import progress
 
 DEFAULT_VIDEO_PREFIX = "xdub_teacher_pairs/videos"
 DEFAULT_METADATA_PREFIX = "xdub_teacher_pairs/meta"
@@ -48,6 +49,7 @@ class HfVideoDatasetBuildConfig:
     bbox_smooth_radius: int = 1
     silence_rms_threshold: float = 1e-3
     max_silence_fraction: float = 0.25
+    progress: bool = True
     dry_run: bool = False
     push: bool = False
     hf_output_repo_id: str = ""
@@ -142,12 +144,20 @@ def prepare_hf_video_raw_dir(
     snapshot_path: str | Path,
     video_files: list[str],
     raw_video_dir: str | Path,
+    *,
+    show_progress: bool = True,
 ) -> list[Path]:
     snapshot_root = Path(snapshot_path)
     out_dir = Path(raw_video_dir)
     prepared: list[Path] = []
     seen: set[str] = set()
-    for relative in video_files:
+    for relative in progress(
+        video_files,
+        enabled=show_progress,
+        desc="prepare HF videos",
+        total=len(video_files),
+        unit="clip",
+    ):
         src = snapshot_root / relative
         if not src.is_file():
             raise FileNotFoundError(src)
@@ -183,6 +193,7 @@ def _dataset_config(config: HfVideoDatasetBuildConfig, raw_video_dir: Path) -> D
         bbox_smooth_radius=config.bbox_smooth_radius,
         silence_rms_threshold=config.silence_rms_threshold,
         max_silence_fraction=config.max_silence_fraction,
+        progress=config.progress,
     )
 
 
@@ -237,7 +248,12 @@ def build_hf_video_dataset(
     if config.cache_dir:
         download_kwargs["cache_dir"] = config.cache_dir
     snapshot_path = Path(snapshot_download(**download_kwargs))
-    raw_video_paths = prepare_hf_video_raw_dir(snapshot_path, selection.video_files, raw_video_dir)
+    raw_video_paths = prepare_hf_video_raw_dir(
+        snapshot_path,
+        selection.video_files,
+        raw_video_dir,
+        show_progress=config.progress,
+    )
     build_summary = build_dataset(
         _dataset_config(config, raw_video_dir),
         strict=config.strict,

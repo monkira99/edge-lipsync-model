@@ -53,6 +53,11 @@ def main() -> None:
         help="Discover GRID samples and print the plan without muxing, building, or pushing.",
     )
     parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
+    parser.add_argument(
         "--push",
         action="store_true",
         help="Push the built dataset to Hugging Face",
@@ -86,6 +91,7 @@ def main() -> None:
             bbox_detector=args.bbox_detector,
             preview_count=args.preview_count,
             dry_run=args.dry_run,
+            progress=not args.no_progress,
             push=args.push,
             hf_repo_id=args.hf_repo_id,
             private=not args.public,

@@ -326,6 +326,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pyyaml" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "wandb" },
 ]
 
@@ -351,6 +352,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "torch", specifier = ">=2.2" },
+    { name = "tqdm", specifier = ">=4.67" },
     { name = "wandb", specifier = ">=0.27.0" },
 ]
 provides-extras = ["dev", "ncnn"]

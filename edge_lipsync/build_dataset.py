@@ -20,6 +20,7 @@ from edge_lipsync.audio_features import (
 )
 from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
 from edge_lipsync.preprocess import make_face_training_sample
+from edge_lipsync.progress import progress
 
 BBox = tuple[int, int, int, int]
 FRAME_SUFFIX = ".png"
@@ -60,6 +61,7 @@ class DatasetBuildConfig:
     bbox_smooth_radius: int = 1
     silence_rms_threshold: float = 1e-3
     max_silence_fraction: float = 0.25
+    progress: bool = True
 
 
 def require_tool(name: str) -> str:
@@ -141,13 +143,29 @@ def normalize_clip(src: Path, out_dir: Path, fps: int, sample_rate: int) -> tupl
     return video_out, audio_out
 
 
-def extract_frames(video_path: Path, frames_dir: Path) -> int:
+def extract_frames(
+    video_path: Path,
+    frames_dir: Path,
+    *,
+    show_progress: bool = True,
+    progress_desc: str = "extract frames",
+) -> int:
     frames_dir.mkdir(parents=True, exist_ok=True)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open normalized video: {video_path}")
+    expected_count = 0
+    if hasattr(capture, "get"):
+        expected_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     count = 0
-    while True:
+    frame_positions = iter(int, 1)
+    for _ in progress(
+        frame_positions,
+        enabled=show_progress,
+        desc=progress_desc,
+        total=expected_count if expected_count > 0 else None,
+        unit="frame",
+    ):
         ok, frame = capture.read()
         if not ok:
             break
@@ -436,7 +454,12 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
     probe_clip(video)
     normalized_video, audio_path = normalize_clip(video, clip_dir, config.fps, config.sample_rate)
     frames_dir = clip_dir / "frames"
-    frame_count = extract_frames(normalized_video, frames_dir)
+    frame_count = extract_frames(
+        normalized_video,
+        frames_dir,
+        show_progress=config.progress,
+        progress_desc=f"extract {clip_id}",
+    )
     bnf = extract_bnf_windows_from_wav(audio_path, config.wenet_onnx)
     np.save(clip_dir / "bnf.npy", bnf.astype(np.float32))
 
@@ -444,7 +467,14 @@ def process_clip(video: Path, config: DatasetBuildConfig) -> dict[str, Any]:
     detected: dict[int, BBox | None] = {}
     frame_shapes: dict[int, tuple[int, ...]] = {}
     try:
-        for frame_idx in range(1, frame_count + 1):
+        frame_indices = range(1, frame_count + 1)
+        for frame_idx in progress(
+            frame_indices,
+            enabled=config.progress,
+            desc=f"detect {clip_id}",
+            total=frame_count,
+            unit="frame",
+        ):
             frame = cv2.imread(
                 str(frames_dir / f"{frame_idx:06d}{FRAME_SUFFIX}"),
                 cv2.IMREAD_COLOR,
@@ -541,7 +571,13 @@ def build_dataset(config: DatasetBuildConfig, *, strict: bool = False) -> dict[s
 
     clips: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    for video in videos:
+    for video in progress(
+        videos,
+        enabled=config.progress,
+        desc="build clips",
+        total=len(videos),
+        unit="clip",
+    ):
         try:
             clips.append(process_clip(video, config))
         except Exception as exc:

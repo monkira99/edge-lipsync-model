@@ -54,6 +54,11 @@ def main() -> None:
         action="store_true",
         help="List selected videos and print the plan without downloading, building, or pushing.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
     parser.add_argument("--push", action="store_true", help="Push processed dataset to HF")
     parser.add_argument(
         "--hf-output-repo-id",
@@ -90,6 +95,7 @@ def main() -> None:
             bbox_detector=args.bbox_detector,
             preview_count=args.preview_count,
             dry_run=args.dry_run,
+            progress=not args.no_progress,
             push=args.push,
             hf_output_repo_id=args.hf_output_repo_id,
             private=not args.public,
