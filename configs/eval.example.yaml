@@ -1,0 +1,7 @@
+dataset_root: /absolute/path/to/data/duix_datasets/avatar_name
+manifest: manifest.jsonl
+ckpt: /absolute/path/to/runs/avatar_name/best.pt
+out_dir: /absolute/path/to/runs/avatar_name/eval
+max_batches: 32
+device: cpu
+fps: 25.0
