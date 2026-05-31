@@ -129,6 +129,42 @@ def test_prepare_grid_raw_videos_muxes_paired_audio(
     ]
 
 
+def test_prepare_grid_raw_videos_reports_progress(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import edge_lipsync.grid_dataset as grid_dataset
+
+    grid_root = tmp_path / "grid"
+    _write_grid_sample(grid_root, "s1", "bbaf2n")
+    samples = grid_dataset.discover_grid_samples(grid_root)
+    calls: list[dict[str, object]] = []
+
+    def fake_progress(iterable: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(grid_dataset, "progress", fake_progress)
+    monkeypatch.setattr(grid_dataset, "require_tool", lambda name: name)
+    monkeypatch.setattr(
+        grid_dataset,
+        "run",
+        lambda command: Path(command[-1]).write_bytes(b"mp4")
+        or subprocess.CompletedProcess(command, 0, "", ""),
+    )
+
+    grid_dataset.prepare_grid_raw_videos(samples, tmp_path / "work" / "raw_videos")
+
+    assert calls == [
+        {
+            "enabled": True,
+            "desc": "prepare GRID videos",
+            "total": 1,
+            "unit": "clip",
+        }
+    ]
+
+
 def test_build_grid_dataset_invokes_builder_and_pushes_snapshot(
     tmp_path: Path,
     monkeypatch: Any,
@@ -226,3 +262,4 @@ def test_build_grid_hf_dataset_cli_help() -> None:
     assert "--dataset-root" in result.stdout
     assert "--dry-run" in result.stdout
     assert "--push" in result.stdout
+    assert "--no-progress" in result.stdout

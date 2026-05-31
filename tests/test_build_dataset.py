@@ -23,6 +23,7 @@ def test_dataset_build_defaults_to_duix_roi_smoothing_radius() -> None:
     config = DatasetBuildConfig(raw_video_dir="raw", dataset_root="dataset", wenet_onnx="wenet")
 
     assert config.bbox_smooth_radius == 1
+    assert config.progress is True
 
 
 def test_extract_frames_writes_lossless_png(
@@ -56,6 +57,53 @@ def test_extract_frames_writes_lossless_png(
     assert count == 1
     assert extracted is not None
     assert np.array_equal(extracted, frame)
+
+
+def test_extract_frames_reports_progress_when_frame_count_is_known(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    frame = np.zeros((4, 5, 3), dtype=np.uint8)
+    calls: list[dict[str, object]] = []
+
+    class FakeCapture:
+        def __init__(self, _path: str) -> None:
+            self._frames = [frame, frame]
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, _prop: int) -> float:
+            return 2.0
+
+        def read(self) -> tuple[bool, np.ndarray | None]:
+            if self._frames:
+                return True, self._frames.pop()
+            return False, None
+
+        def release(self) -> None:
+            pass
+
+    def fake_progress(iterable: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(builder.cv2, "VideoCapture", FakeCapture)
+    monkeypatch.setattr(builder, "progress", fake_progress)
+
+    count = builder.extract_frames(tmp_path / "video.mkv", tmp_path / "frames")
+
+    assert count == 2
+    assert calls == [
+        {
+            "enabled": True,
+            "desc": "extract frames",
+            "total": 2,
+            "unit": "frame",
+        }
+    ]
 
 
 def test_normalize_clip_preserves_source_sample_rate_for_python_resampling(
@@ -237,7 +285,7 @@ def test_process_clip_uses_landmark_roi_not_raw_face_detector(
     wenet = tmp_path / "wenet.onnx"
     wenet.write_bytes(b"fixture")
 
-    def fake_extract_frames(_video_path: Path, frames_dir: Path) -> int:
+    def fake_extract_frames(_video_path: Path, frames_dir: Path, **_kwargs: object) -> int:
         frames_dir.mkdir(parents=True, exist_ok=True)
         frame = np.full((960, 540, 3), 120, dtype=np.uint8)
         cv2.imwrite(str(frames_dir / "000001.png"), frame)
@@ -330,6 +378,54 @@ def test_build_dataset_records_clip_failure_unless_strict(
         builder.build_dataset(config, strict=True)
 
 
+def test_build_dataset_reports_progress_for_clip_processing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    for filename in ("b.mp4", "a.mp4"):
+        (raw_dir / filename).write_bytes(b"video")
+    wenet = tmp_path / "wenet.onnx"
+    wenet.write_bytes(b"fixture")
+    config = builder.DatasetBuildConfig(
+        raw_video_dir=str(raw_dir),
+        dataset_root=str(tmp_path / "dataset"),
+        wenet_onnx=str(wenet),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_progress(iterable: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(builder, "progress", fake_progress)
+    monkeypatch.setattr(
+        builder,
+        "process_clip",
+        lambda video, _config: {
+            "clip_id": video.stem,
+            "valid_frames": [],
+            "bboxes": {},
+            "flags": {},
+            "quality": {"drop_counts": {}},
+        },
+    )
+
+    builder.build_dataset(config)
+
+    assert calls == [
+        {
+            "enabled": True,
+            "desc": "build clips",
+            "total": 2,
+            "unit": "clip",
+        }
+    ]
+
+
 def test_build_dataset_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/build_dataset.py", "--help"],
@@ -340,3 +436,4 @@ def test_build_dataset_cli_help() -> None:
 
     assert "Build Duix training dataset" in result.stdout
     assert "--strict" in result.stdout
+    assert "--no-progress" in result.stdout

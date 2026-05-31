@@ -7,6 +7,7 @@ from typing import Any
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset, require_tool, run
 from edge_lipsync.hub import push_dataset_snapshot
+from edge_lipsync.progress import progress
 
 GRID_VIDEO_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg"}
 GRID_AUDIO_SUFFIXES = {".wav"}
@@ -55,6 +56,7 @@ class GridBuildConfig:
     bbox_smooth_radius: int = 1
     silence_rms_threshold: float = 1e-3
     max_silence_fraction: float = 0.25
+    progress: bool = True
     dry_run: bool = False
     push: bool = False
     hf_repo_id: str = ""
@@ -192,10 +194,17 @@ def prepare_grid_raw_videos(
     *,
     fps: int = 25,
     sample_rate: int = 16000,
+    show_progress: bool = True,
 ) -> PreparedGridVideos:
     out_dir = Path(raw_video_dir)
     raw_video_paths: list[Path] = []
-    for sample in samples:
+    for sample in progress(
+        samples,
+        enabled=show_progress,
+        desc="prepare GRID videos",
+        total=len(samples),
+        unit="clip",
+    ):
         output_path = out_dir / _raw_video_filename(sample)
         _mux_grid_sample(sample, output_path, fps=fps, sample_rate=sample_rate)
         raw_video_paths.append(output_path)
@@ -228,6 +237,7 @@ def _dataset_config(config: GridBuildConfig, raw_video_dir: Path) -> DatasetBuil
         bbox_smooth_radius=config.bbox_smooth_radius,
         silence_rms_threshold=config.silence_rms_threshold,
         max_silence_fraction=config.max_silence_fraction,
+        progress=config.progress,
     )
 
 
@@ -264,6 +274,7 @@ def build_grid_dataset(config: GridBuildConfig) -> GridBuildResult:
         raw_video_dir,
         fps=config.fps,
         sample_rate=config.sample_rate,
+        show_progress=config.progress,
     )
     build_summary = build_dataset(
         _dataset_config(config, prepared.raw_video_dir),
