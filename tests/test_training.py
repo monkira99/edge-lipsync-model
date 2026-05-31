@@ -433,6 +433,67 @@ def test_train_finishes_tracker_with_error_code_when_step_fails(
     assert tracker.exit_codes == [1]
 
 
+def test_train_finishes_tracker_with_error_code_when_dataset_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+
+    class FakeTracker:
+        provenance = {"mode": "offline", "run_id": "run-id", "run_url": "run-url"}
+
+        def __init__(self) -> None:
+            self.exit_codes: list[int] = []
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            pass
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            pass
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(
+        training,
+        "DuixManifestDataset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated dataset failure")),
+    )
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(tmp_path / "run"),
+        init_bin="/tmp/dh_model.bin",
+        device="cpu",
+        max_steps=1,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated dataset failure"):
+        training.train(config)
+
+    assert tracker.exit_codes == [1]
+
+
 def test_tiny_overfit_loss_decreases() -> None:
     from edge_lipsync.losses import combined_reconstruction_loss
     from edge_lipsync.training import run_train_step

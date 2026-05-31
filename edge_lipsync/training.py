@@ -352,35 +352,39 @@ def train(config: TrainConfig) -> Path:
         provenance=provenance,
     )
     provenance["wandb"] = tracker.provenance
-    mixed_precision = use_mixed_precision(config, device)
-    train_dataset = DuixManifestDataset(dataset_root, manifest_path, split="train")
-    val_dataset = DuixManifestDataset(dataset_root, manifest_path, split="val")
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-    )
-    validate_batch_shapes(next(iter(train_loader)))
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
-    scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
+    try:
+        mixed_precision = use_mixed_precision(config, device)
+        train_dataset = DuixManifestDataset(dataset_root, manifest_path, split="train")
+        val_dataset = DuixManifestDataset(dataset_root, manifest_path, split="val")
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
+        validate_batch_shapes(next(iter(train_loader)))
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
 
-    metrics: list[dict[str, float | int | str]] = []
-    best_val = float("inf")
-    best_path = run_dir / "best.pt"
-    step = 0
-    epoch = 0
-    active_phase = ""
+        metrics: list[dict[str, float | int | str]] = []
+        best_val = float("inf")
+        best_path = run_dir / "best.pt"
+        step = 0
+        epoch = 0
+        active_phase = ""
+    except Exception:
+        tracker.finish(exit_code=1)
+        raise
     try:
         while step < config.max_steps:
             epoch += 1
