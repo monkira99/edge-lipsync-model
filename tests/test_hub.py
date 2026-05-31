@@ -66,6 +66,24 @@ def _write_run_dir(root: Path) -> Path:
     return run_dir
 
 
+def _write_model_assets_root(root: Path) -> Path:
+    models_root = root / "models"
+    for relative in (
+        "duix_detector/pfpld_robust_sim_bs1_8003.onnx",
+        "duix_detector/scrfd_500m_kps-opt2.bin",
+        "duix_detector/scrfd_500m_kps-opt2.param",
+        "emma/dh_model.bin",
+        "emma/dh_model.param",
+        "emma/weight_168u.bin",
+        "mediapipe/face_landmarker.task",
+        "wenet/wenet.onnx",
+    ):
+        path = models_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(relative.encode())
+    return models_root
+
+
 def test_push_dataset_snapshot_uploads_only_processed_artifacts(tmp_path: Path) -> None:
     from edge_lipsync.hub import DATASET_UPLOAD_PATTERNS, push_dataset_snapshot
 
@@ -159,6 +177,40 @@ def test_push_model_artifacts_uses_model_allowlist(tmp_path: Path) -> None:
     assert "repo_type" not in api.uploads[0]
 
 
+def test_push_model_assets_uploads_assets_allowlist(tmp_path: Path) -> None:
+    from edge_lipsync.hub import MODEL_ASSET_UPLOAD_PATTERNS, push_model_assets
+
+    api = _FakeApi()
+    models_root = _write_model_assets_root(tmp_path)
+
+    result = push_model_assets(models_root, "owner/edge-lipsync-model-assets", api=api)
+
+    assert result.resolved_revision == "model-commit"
+    assert api.created == [
+        {
+            "repo_id": "owner/edge-lipsync-model-assets",
+            "private": True,
+            "exist_ok": True,
+        }
+    ]
+    assert api.uploads[0]["folder_path"] == str(models_root)
+    assert api.uploads[0]["allow_patterns"] == MODEL_ASSET_UPLOAD_PATTERNS
+    assert "repo_type" not in api.uploads[0]
+
+
+def test_push_model_assets_validates_required_files_before_api_call(tmp_path: Path) -> None:
+    from edge_lipsync.hub import push_model_assets
+
+    api = _FakeApi()
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="Required artifact"):
+        push_model_assets(models_root, "owner/edge-lipsync-model-assets", api=api)
+
+    assert api.created == []
+
+
 def test_pull_model_checkpoint_requires_revision() -> None:
     from edge_lipsync.hub import pull_model_checkpoint
 
@@ -196,11 +248,51 @@ def test_pull_model_checkpoint_resolves_file_and_revision(
     ]
 
 
+def test_pull_model_assets_downloads_snapshot_to_local_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.hub as hub
+    from edge_lipsync.hub import MODEL_ASSET_UPLOAD_PATTERNS
+
+    local_dir = tmp_path / "models"
+    local_dir.mkdir()
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return str(local_dir)
+
+    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
+
+    result = hub.pull_model_assets(
+        "owner/edge-lipsync-model-assets",
+        revision="asset-v1",
+        local_dir=str(local_dir),
+        cache_dir="/cache",
+        api=_FakeApi(),
+    )
+
+    assert result.path == local_dir
+    assert result.requested_revision == "asset-v1"
+    assert result.resolved_revision == "model-sha"
+    assert calls == [
+        {
+            "repo_id": "owner/edge-lipsync-model-assets",
+            "revision": "asset-v1",
+            "allow_patterns": MODEL_ASSET_UPLOAD_PATTERNS,
+            "local_dir": str(local_dir),
+            "cache_dir": "/cache",
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("script", "description"),
     [
         ("tools/hf_dataset.py", "Manage processed datasets"),
         ("tools/hf_model.py", "Manage trained model artifacts"),
+        ("tools/hf_model_assets.py", "Manage reusable model assets"),
     ],
 )
 def test_hub_cli_help(script: str, description: str) -> None:

@@ -19,3 +19,6 @@ checkpoints/
 *.wav
 *.npy
 *.npz
+
+models/**
+!models/.gitkeep

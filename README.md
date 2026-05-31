@@ -31,6 +31,33 @@ dataset config:
 https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 ```
 
+## Download Model Assets
+
+Large reusable assets are stored on Hugging Face instead of GitHub:
+
+```text
+tiennguyenbnbk/edge-lipsync-model-assets
+revision: 9a2ee098b0af5a714141e50911591e3ab29fcf4d
+```
+
+The repository is private. Authenticate with Hugging Face before downloading:
+
+```bash
+hf auth login
+.venv/bin/python tools/hf_model_assets.py pull \
+  --repo-id tiennguyenbnbk/edge-lipsync-model-assets \
+  --revision 9a2ee098b0af5a714141e50911591e3ab29fcf4d \
+  --local-dir models
+```
+
+To publish a refreshed local `models/` snapshot:
+
+```bash
+.venv/bin/python tools/hf_model_assets.py push \
+  --models-root models \
+  --repo-id tiennguyenbnbk/edge-lipsync-model-assets
+```
+
 ## Verify
 
 ```bash

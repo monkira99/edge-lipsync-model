@@ -43,8 +43,24 @@ MODEL_UPLOAD_PATTERNS = (
     "run_metadata.json",
     "README.md",
 )
+MODEL_ASSET_UPLOAD_PATTERNS = (
+    "duix_detector/*",
+    "emma/*",
+    "mediapipe/*",
+    "wenet/*",
+)
 DATASET_REQUIRED_PATHS = ("manifest.jsonl", "splits.json", "build_summary.json", "clips")
 MODEL_REQUIRED_PATHS = ("best.pt", "final.pt", "metrics.json", "metrics.csv", "run_metadata.json")
+MODEL_ASSET_REQUIRED_PATHS = (
+    "duix_detector/pfpld_robust_sim_bs1_8003.onnx",
+    "duix_detector/scrfd_500m_kps-opt2.bin",
+    "duix_detector/scrfd_500m_kps-opt2.param",
+    "emma/dh_model.bin",
+    "emma/dh_model.param",
+    "emma/weight_168u.bin",
+    "mediapipe/face_landmarker.task",
+    "wenet/wenet.onnx",
+)
 
 @dataclass(frozen=True)
 class HubArtifact:
@@ -173,6 +189,63 @@ def pull_model_checkpoint(
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     path = Path(hf_hub_download(**kwargs))
+    info = _client(api).model_info(repo_id=repo_id, revision=revision)
+    resolved = str(info.sha)
+    return HubArtifact(
+        repo_id=repo_id,
+        requested_revision=revision,
+        resolved_revision=resolved,
+        path=path,
+        url=_repo_url(repo_id, repo_type="model", revision=resolved),
+    )
+
+
+def push_model_assets(
+    models_root: str | Path,
+    repo_id: str,
+    *,
+    private: bool = True,
+    commit_message: str = "Upload model assets",
+    api: Any | None = None,
+) -> HubArtifact:
+    root = Path(models_root)
+    _validate_required_paths(root, MODEL_ASSET_REQUIRED_PATHS)
+    client = _client(api)
+    client.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+    commit = client.upload_folder(
+        folder_path=str(root),
+        repo_id=repo_id,
+        allow_patterns=MODEL_ASSET_UPLOAD_PATTERNS,
+        commit_message=commit_message,
+    )
+    revision = str(commit.oid)
+    return HubArtifact(
+        repo_id=repo_id,
+        requested_revision=revision,
+        resolved_revision=revision,
+        url=_repo_url(repo_id, repo_type="model", revision=revision),
+    )
+
+
+def pull_model_assets(
+    repo_id: str,
+    *,
+    revision: str,
+    local_dir: str = "models",
+    cache_dir: str = "",
+    api: Any | None = None,
+) -> HubArtifact:
+    _require_revision(revision)
+    kwargs = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "allow_patterns": MODEL_ASSET_UPLOAD_PATTERNS,
+    }
+    if local_dir:
+        kwargs["local_dir"] = local_dir
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+    path = Path(snapshot_download(**kwargs))
     info = _client(api).model_info(repo_id=repo_id, revision=revision)
     resolved = str(info.sha)
     return HubArtifact(
