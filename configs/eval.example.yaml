@@ -5,3 +5,9 @@ out_dir: /absolute/path/to/runs/avatar_name/eval
 max_batches: 32
 device: cpu
 fps: 25.0
+hf_dataset_repo: ""
+hf_dataset_revision: ""
+hf_model_repo: ""
+hf_model_revision: ""
+hf_model_filename: best.pt
+hf_cache_dir: ""
