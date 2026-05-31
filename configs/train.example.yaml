@@ -1,0 +1,17 @@
+dataset_root: /absolute/path/to/data/duix_datasets/avatar_name
+manifest: manifest.jsonl
+run_dir: /absolute/path/to/runs/avatar_name
+init_bin: /absolute/path/to/dh_model.bin
+init_ckpt: ""
+device: auto
+precision: auto
+batch_size: 2
+num_workers: 0
+learning_rate: 0.00001
+weight_decay: 0.0001
+max_steps: 1000
+warmup_steps: 100
+stabilization_steps: 100
+stabilization_lr_scale: 0.1
+validation_interval: 100
+checkpoint_interval: 100
