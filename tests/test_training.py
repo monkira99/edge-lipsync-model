@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -98,6 +99,44 @@ def test_run_validation_reports_reconstruction_mouth_and_temporal_metrics() -> N
     assert metrics["val_reconstruction_loss"] > 0
     assert metrics["val_mouth_loss"] > 0
     assert metrics["val_temporal_delta"] > 0
+
+
+def test_phase_for_step_covers_warmup_main_and_stabilization() -> None:
+    from edge_lipsync.training import phase_for_step
+
+    kwargs = {"max_steps": 10, "warmup_steps": 2, "stabilization_steps": 2}
+
+    assert phase_for_step(1, **kwargs) == "warmup"
+    assert phase_for_step(3, **kwargs) == "main"
+    assert phase_for_step(9, **kwargs) == "stabilization"
+
+
+def test_mixed_precision_rejects_cpu_device() -> None:
+    from edge_lipsync.training import TrainConfig, use_mixed_precision
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        manifest="manifest",
+        run_dir="run",
+        precision="mixed",
+    )
+
+    with pytest.raises(ValueError, match="CUDA"):
+        use_mixed_precision(config, torch.device("cpu"))
+
+
+def test_build_model_rejects_missing_init_checkpoint(tmp_path: Path) -> None:
+    from edge_lipsync.training import TrainConfig, build_model
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        manifest="manifest",
+        run_dir="run",
+        init_ckpt=str(tmp_path / "missing.pt"),
+    )
+
+    with pytest.raises(FileNotFoundError):
+        build_model(config, torch.device("cpu"))
 
 
 def test_tiny_overfit_loss_decreases() -> None:

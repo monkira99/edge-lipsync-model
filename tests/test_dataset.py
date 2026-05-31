@@ -74,3 +74,12 @@ def test_manifest_record_rejects_absolute_asset_paths() -> None:
                 "flags": [],
             }
         )
+
+
+def test_dataset_rejects_empty_split(tmp_path: Path) -> None:
+    from edge_lipsync.dataset import DuixManifestDataset
+
+    manifest = _write_fixture_dataset(tmp_path)
+
+    with pytest.raises(ValueError, match="No records"):
+        DuixManifestDataset(tmp_path, manifest, split="val")

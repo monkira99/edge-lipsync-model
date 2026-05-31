@@ -51,6 +51,27 @@ def test_smooth_bboxes_uses_neighboring_frames() -> None:
     assert smoothed[2] == (15, 15, 110, 110)
 
 
+def test_clean_bboxes_drops_discontinuous_tracking_jump() -> None:
+    from edge_lipsync.build_dataset import BBoxGates, clean_bboxes
+
+    boxes = {
+        1: (10, 10, 50, 50),
+        2: (150, 150, 190, 190),
+    }
+    frame_shapes = {1: (200, 200, 3), 2: (200, 200, 3)}
+
+    cleaned, _flags, drops = clean_bboxes(
+        boxes,
+        frame_shapes,
+        gates=BBoxGates(min_size=32, max_frame_fraction=0.9, max_jump_fraction=0.25),
+        max_missing_gap=1,
+        smooth_radius=0,
+    )
+
+    assert cleaned == {1: (10, 10, 50, 50)}
+    assert drops["discontinuous_jump"] == 1
+
+
 @pytest.mark.parametrize(
     ("bbox", "reason"),
     [
