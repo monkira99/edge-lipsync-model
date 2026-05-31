@@ -4,9 +4,11 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
+import pytest
 
 
 def test_chw_norm_to_rgb_u8_shape() -> None:
@@ -72,3 +74,71 @@ def test_render_eval_cli_help() -> None:
 
     assert "Render validation" in result.stdout
     assert "--config" in result.stdout
+    assert "--hf-dataset-repo" in result.stdout
+    assert "--hf-model-repo" in result.stdout
+
+
+def test_resolve_eval_inputs_uses_pinned_hub_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.eval as evaluation
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_dataset(**kwargs: Any) -> ResolvedSource:
+        calls.append(("dataset", kwargs))
+        return ResolvedSource(path=dataset_root, provenance={"source": "huggingface"})
+
+    def fake_model(**kwargs: Any) -> ResolvedSource:
+        calls.append(("model", kwargs))
+        return ResolvedSource(path=checkpoint, provenance={"source": "huggingface"})
+
+    monkeypatch.setattr(evaluation, "resolve_dataset_source", fake_dataset)
+    monkeypatch.setattr(evaluation, "resolve_model_source", fake_model)
+    config = evaluation.RenderEvalConfig(
+        dataset_root="",
+        ckpt="",
+        out_dir=str(tmp_path / "eval"),
+        hf_dataset_repo="owner/avatar-data",
+        hf_dataset_revision="data-v1",
+        hf_model_repo="owner/avatar-model",
+        hf_model_revision="model-v1",
+        hf_model_filename="final.pt",
+        hf_cache_dir="/cache",
+    )
+
+    resolved = evaluation.resolve_eval_inputs(config)
+
+    assert resolved.dataset_root == dataset_root
+    assert resolved.checkpoint == checkpoint
+    assert resolved.provenance == {
+        "dataset": {"source": "huggingface"},
+        "model": {"source": "huggingface"},
+    }
+    assert calls == [
+        (
+            "dataset",
+            {
+                "dataset_root": "",
+                "hf_repo": "owner/avatar-data",
+                "hf_revision": "data-v1",
+                "cache_dir": "/cache",
+            },
+        ),
+        (
+            "model",
+            {
+                "checkpoint": "",
+                "hf_repo": "owner/avatar-model",
+                "hf_revision": "model-v1",
+                "hf_filename": "final.pt",
+                "cache_dir": "/cache",
+            },
+        ),
+    ]

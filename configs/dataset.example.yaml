@@ -5,7 +5,11 @@ fps: 25
 sample_rate: 16000
 split_strategy: clip
 validation_fraction: 0.2
-bbox_detector: haar
+bbox_detector: mediapipe_face_landmarker
+landmark_model_asset_path: /absolute/path/to/face_landmarker.task
+landmark_min_detection_confidence: 0.5
+landmark_min_tracking_confidence: 0.5
+landmark_refine_landmarks: true
 preview_count: 8
 min_bbox_size: 32
 max_bbox_frame_fraction: 0.9

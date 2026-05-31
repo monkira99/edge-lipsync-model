@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from edge_lipsync.dataset import DuixManifestDataset  # noqa: E402
-from edge_lipsync.eval import RenderEvalConfig, render_validation_artifacts  # noqa: E402
+from edge_lipsync.eval import (  # noqa: E402
+    RenderEvalConfig,
+    render_validation_artifacts,
+    resolve_eval_inputs,
+)
 from edge_lipsync.model import load_ckpt  # noqa: E402
 
 
@@ -24,7 +28,21 @@ def _load_config(args: argparse.Namespace) -> RenderEvalConfig:
         if not isinstance(loaded, dict):
             raise ValueError("Eval config must be a YAML mapping")
         payload.update(loaded)
-    for field in ("dataset_root", "manifest", "ckpt", "out_dir", "max_batches", "device", "fps"):
+    for field in (
+        "dataset_root",
+        "manifest",
+        "ckpt",
+        "out_dir",
+        "max_batches",
+        "device",
+        "fps",
+        "hf_dataset_repo",
+        "hf_dataset_revision",
+        "hf_model_repo",
+        "hf_model_revision",
+        "hf_model_filename",
+        "hf_cache_dir",
+    ):
         value = getattr(args, field)
         if value is not None:
             payload[field] = value
@@ -43,16 +61,23 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--device")
     parser.add_argument("--fps", type=float)
+    parser.add_argument("--hf-dataset-repo")
+    parser.add_argument("--hf-dataset-revision")
+    parser.add_argument("--hf-model-repo")
+    parser.add_argument("--hf-model-revision")
+    parser.add_argument("--hf-model-filename")
+    parser.add_argument("--hf-cache-dir")
     args = parser.parse_args()
     config = _load_config(args)
+    inputs = resolve_eval_inputs(config)
 
-    dataset = DuixManifestDataset(config.dataset_root, config.manifest, split="val")
-    model = load_ckpt(config.ckpt, map_location=config.device)
+    dataset = DuixManifestDataset(inputs.dataset_root, config.manifest, split="val")
+    model = load_ckpt(inputs.checkpoint, map_location=config.device)
     artifacts = render_validation_artifacts(
         model=model,
         dataset=dataset,
         out_dir=config.out_dir,
-        checkpoint_path=config.ckpt,
+        checkpoint_path=inputs.checkpoint,
         device=torch.device(config.device),
         max_batches=config.max_batches,
         fps=config.fps,

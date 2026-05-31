@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -137,6 +139,359 @@ def test_build_model_rejects_missing_init_checkpoint(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError):
         build_model(config, torch.device("cpu"))
+
+
+def test_build_model_loads_pinned_hub_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    expected_model = _FaceAudioModel()
+
+    def fake_resolve_model_source(**kwargs: str) -> ResolvedSource:
+        assert kwargs == {
+            "checkpoint": "",
+            "hf_repo": "owner/avatar-model",
+            "hf_revision": "model-v1",
+            "hf_filename": "best.pt",
+            "cache_dir": "/cache",
+        }
+        return ResolvedSource(
+            path=checkpoint,
+            provenance={
+                "source": "huggingface",
+                "repo_id": "owner/avatar-model",
+                "requested_revision": "model-v1",
+                "resolved_revision": "model-sha",
+            },
+        )
+
+    monkeypatch.setattr(training, "resolve_model_source", fake_resolve_model_source)
+    monkeypatch.setattr(training, "load_ckpt", lambda path, map_location: expected_model)
+    config = training.TrainConfig(
+        dataset_root="dataset",
+        manifest="manifest",
+        run_dir="run",
+        hf_init_model_repo="owner/avatar-model",
+        hf_init_model_revision="model-v1",
+        hf_cache_dir="/cache",
+    )
+
+    model, source = training.build_model(config, torch.device("cpu"))
+
+    assert model is expected_model
+    assert source["kind"] == "huggingface_checkpoint"
+    assert source["resolved_revision"] == "model-sha"
+
+
+def test_write_run_metadata_records_provenance(tmp_path: Path) -> None:
+    from edge_lipsync.training import write_run_metadata
+
+    best = tmp_path / "best.pt"
+    final = tmp_path / "final.pt"
+
+    out = write_run_metadata(
+        tmp_path,
+        provenance={"dataset": {"source": "local"}},
+        best_checkpoint=best,
+        final_checkpoint=final,
+    )
+
+    assert json.loads(out.read_text(encoding="utf-8")) == {
+        "provenance": {"dataset": {"source": "local"}},
+        "artifacts": {
+            "best_checkpoint": str(best.resolve()),
+            "final_checkpoint": str(final.resolve()),
+        },
+    }
+
+
+def test_write_model_card_links_dataset_and_wandb(tmp_path: Path) -> None:
+    from edge_lipsync.training import write_model_card
+
+    out = write_model_card(
+        tmp_path,
+        provenance={
+            "dataset": {
+                "repo_id": "owner/avatar-data",
+                "resolved_revision": "data-sha",
+            },
+            "wandb": {
+                "run_url": "https://wandb.ai/owner/project/runs/run-id",
+            },
+        },
+    )
+
+    text = out.read_text(encoding="utf-8")
+    assert "owner/avatar-data" in text
+    assert "data-sha" in text
+    assert "https://wandb.ai/owner/project/runs/run-id" in text
+
+
+def test_train_logs_writes_final_artifacts_and_publishes_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.hub import HubArtifact
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    manifest = dataset_root / "manifest.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    class FakeTracker:
+        def __init__(self) -> None:
+            self.logged: list[tuple[dict[str, Any], int]] = []
+            self.summary: dict[str, Any] = {}
+            self.exit_codes: list[int] = []
+
+        @property
+        def provenance(self) -> dict[str, str]:
+            return {
+                "mode": "offline",
+                "run_id": "run-id",
+                "run_url": "https://wandb.ai/owner/project/runs/run-id",
+            }
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            self.logged.append((metrics, step))
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            self.summary.update(values)
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+    uploads: list[tuple[Path, str, bool]] = []
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(
+            path=dataset_root,
+            provenance={
+                "source": "huggingface",
+                "repo_id": "owner/avatar-data",
+                "requested_revision": "data-v1",
+                "resolved_revision": "data-sha",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+
+    def fake_push(run_path: Path, repo_id: str, *, private: bool) -> HubArtifact:
+        uploads.append((run_path, repo_id, private))
+        assert (run_path / "best.pt").exists()
+        assert (run_path / "final.pt").exists()
+        assert (run_path / "run_metadata.json").exists()
+        assert (run_path / "README.md").exists()
+        return HubArtifact(
+            repo_id=repo_id,
+            requested_revision="model-sha",
+            resolved_revision="model-sha",
+            url="https://huggingface.co/owner/avatar-model/tree/model-sha",
+        )
+
+    monkeypatch.setattr(training, "push_model_artifacts", fake_push)
+    config = training.TrainConfig(
+        dataset_root="",
+        manifest="manifest.jsonl",
+        run_dir=str(run_dir),
+        init_bin="/tmp/dh_model.bin",
+        hf_dataset_repo="owner/avatar-data",
+        hf_dataset_revision="data-v1",
+        hf_model_repo="owner/avatar-model",
+        wandb_mode="offline",
+        device="cpu",
+        max_steps=1,
+        warmup_steps=0,
+        stabilization_steps=0,
+        validation_interval=1,
+        checkpoint_interval=1,
+    )
+
+    best = training.train(config)
+
+    assert best == run_dir / "best.pt"
+    assert (run_dir / "final.pt").exists()
+    assert uploads == [(run_dir, "owner/avatar-model", True)]
+    assert len(tracker.logged) == 1
+    assert tracker.logged[0][1] == 1
+    assert tracker.summary["hf_model_revision"] == "model-sha"
+    assert tracker.exit_codes == [0]
+    metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["provenance"]["dataset"]["resolved_revision"] == "data-sha"
+    assert metadata["provenance"]["model"]["resolved_revision"] == "model-sha"
+
+
+def test_train_finishes_tracker_with_error_code_when_step_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    class FakeTracker:
+        provenance = {"mode": "offline", "run_id": "run-id", "run_url": "run-url"}
+
+        def __init__(self) -> None:
+            self.exit_codes: list[int] = []
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            pass
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            pass
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(
+        training,
+        "run_train_step",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated step failure")),
+    )
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(tmp_path / "run"),
+        init_bin="/tmp/dh_model.bin",
+        device="cpu",
+        max_steps=1,
+        warmup_steps=0,
+        stabilization_steps=0,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        training.train(config)
+
+    assert tracker.exit_codes == [1]
+
+
+def test_train_finishes_tracker_with_error_code_when_dataset_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+
+    class FakeTracker:
+        provenance = {"mode": "offline", "run_id": "run-id", "run_url": "run-url"}
+
+        def __init__(self) -> None:
+            self.exit_codes: list[int] = []
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            pass
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            pass
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(
+        training,
+        "DuixManifestDataset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated dataset failure")),
+    )
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(tmp_path / "run"),
+        init_bin="/tmp/dh_model.bin",
+        device="cpu",
+        max_steps=1,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated dataset failure"):
+        training.train(config)
+
+    assert tracker.exit_codes == [1]
 
 
 def test_tiny_overfit_loss_decreases() -> None:

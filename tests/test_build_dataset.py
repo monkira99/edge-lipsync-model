@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -153,6 +154,78 @@ def test_write_preview_outputs_overlay_real_masked_and_target(tmp_path: Path) ->
         "000001_real.jpg",
         "000001_target.jpg",
     ]
+
+
+def test_process_clip_uses_landmark_roi_not_raw_face_detector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.build_dataset as builder
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    video = raw_dir / "clip.mp4"
+    video.write_bytes(b"fixture")
+    wenet = tmp_path / "wenet.onnx"
+    wenet.write_bytes(b"fixture")
+
+    def fake_extract_frames(_video_path: Path, frames_dir: Path) -> int:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        frame = np.full((960, 540, 3), 120, dtype=np.uint8)
+        cv2.imwrite(str(frames_dir / "000001.jpg"), frame)
+        return 1
+
+    def fake_normalize_clip(
+        _src: Path,
+        out_dir: Path,
+        _fps: int,
+        _sample_rate: int,
+    ) -> tuple[Path, Path]:
+        return out_dir / "video.mp4", out_dir / "audio.wav"
+
+    class FakeLandmarkDetector:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def detect_bbox(self, _frame: np.ndarray) -> tuple[int, int, int, int]:
+            return (120, 320, 440, 640)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(builder, "probe_clip", lambda _path: {"streams": []})
+    monkeypatch.setattr(builder, "normalize_clip", fake_normalize_clip)
+    monkeypatch.setattr(builder, "extract_frames", fake_extract_frames)
+    monkeypatch.setattr(
+        builder,
+        "extract_bnf_windows_from_wav",
+        lambda _audio_path, _wenet: np.zeros((2, 256), dtype=np.float32),
+    )
+    monkeypatch.setattr(builder, "load_wav_mono_f32", lambda _path: np.ones(640, dtype=np.float32))
+    monkeypatch.setattr(builder, "_silent_audio_indices", lambda _audio, _threshold: set())
+    monkeypatch.setattr(builder, "detect_largest_face", lambda _frame: (86, 136, 475, 525))
+    monkeypatch.setattr(
+        builder,
+        "MediaPipeFaceLandmarkerDetector",
+        FakeLandmarkDetector,
+        raising=False,
+    )
+
+    config = builder.DatasetBuildConfig(
+        raw_video_dir=str(raw_dir),
+        dataset_root=str(tmp_path / "dataset"),
+        wenet_onnx=str(wenet),
+        bbox_detector="mediapipe_face_landmarker",
+        preview_count=0,
+    )
+
+    clip = builder.process_clip(video, config)
+
+    assert clip["bboxes"][1] == (120, 320, 440, 640)
+    bboxes = json.loads(
+        (tmp_path / "dataset/clips/clip/bboxes.json").read_text(encoding="utf-8")
+    )
+    assert bboxes["1"] == [120, 320, 440, 640]
 
 
 def test_build_dataset_records_clip_failure_unless_strict(
