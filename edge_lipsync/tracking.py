@@ -23,6 +23,8 @@ class Tracker(Protocol):
 
     def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None: ...
 
+    def log_video(self, name: str, path: str, *, step: int, caption: str = "") -> None: ...
+
     def update_summary(self, values: dict[str, Any]) -> None: ...
 
     def finish(self, *, exit_code: int = 0) -> None: ...
@@ -34,6 +36,9 @@ class DisabledTracker:
         return {"mode": "disabled"}
 
     def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+        pass
+
+    def log_video(self, name: str, path: str, *, step: int, caption: str = "") -> None:
         pass
 
     def update_summary(self, values: dict[str, Any]) -> None:
@@ -73,6 +78,7 @@ class WandbTracker:
         kwargs.update({key: value for key, value in optional.items() if value})
         if config.tags:
             kwargs["tags"] = list(config.tags)
+        self._wandb = wandb
         self._run = wandb.init(**kwargs)
         if self._run is None:
             raise RuntimeError("wandb.init() returned no run")
@@ -88,6 +94,10 @@ class WandbTracker:
 
     def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
         self._run.log(dict(metrics), step=step)
+
+    def log_video(self, name: str, path: str, *, step: int, caption: str = "") -> None:
+        video = self._wandb.Video(str(path), format="mp4", caption=caption)
+        self._run.log({name: video}, step=step)
 
     def update_summary(self, values: dict[str, Any]) -> None:
         self._run.summary.update(values)

@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset, manifest_sha256
+from edge_lipsync.eval import render_validation_artifacts
 from edge_lipsync.hf_datasets import load_processed_dataset
 from edge_lipsync.hub import push_model_artifacts
 from edge_lipsync.losses import (
@@ -44,6 +45,11 @@ class TrainConfig:
     validation_interval: int = 100
     checkpoint_interval: int = 100
     log_interval: int = 10
+    media_eval_on_best: bool = True
+    media_eval_clip_count: int = 2
+    media_eval_clip_ids: tuple[str, ...] = ()
+    media_eval_max_frames_per_clip: int = 250
+    media_eval_fps: float = 25.0
     hf_dataset_repo: str = ""
     hf_cache_dir: str = ""
     hf_init_model_repo: str = ""
@@ -67,6 +73,13 @@ class PreparedTrainingDatasets:
     dataset_root: Path
     manifest_path: Path
     provenance: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MediaEvalSelection:
+    dataset: Any
+    clip_ids: tuple[str, ...]
+    indices: tuple[int, ...]
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -295,6 +308,83 @@ def write_run_metadata(
     return output
 
 
+def _clip_ids_from_dataset(dataset: Any) -> list[str]:
+    records = getattr(dataset, "records", None)
+    if records is not None:
+        return [str(record.clip_id) for record in records]
+
+    inner_dataset = getattr(dataset, "dataset", None)
+    if inner_dataset is not None:
+        try:
+            return [str(value) for value in inner_dataset["clip_id"]]
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    clip_ids: list[str] = []
+    for index in range(len(dataset)):
+        sample = dataset[index]
+        if not isinstance(sample, dict):
+            raise ValueError(f"Cannot read clip_id from dataset sample index={index}")
+        meta = sample.get("meta")
+        if not isinstance(meta, dict) or "clip_id" not in meta:
+            raise ValueError(f"Cannot read clip_id from dataset sample index={index}")
+        clip_ids.append(str(meta["clip_id"]))
+    return clip_ids
+
+
+def build_media_eval_selection(
+    dataset: Any,
+    *,
+    clip_count: int,
+    clip_ids: Iterable[str],
+    max_frames_per_clip: int,
+) -> MediaEvalSelection:
+    if max_frames_per_clip <= 0:
+        raise ValueError("media_eval_max_frames_per_clip must be positive")
+    requested_clip_ids = tuple(str(clip_id) for clip_id in clip_ids)
+    if clip_count <= 0 and not requested_clip_ids:
+        raise ValueError("media_eval_clip_count must be positive when media_eval_clip_ids is empty")
+
+    all_clip_ids = _clip_ids_from_dataset(dataset)
+    if not all_clip_ids:
+        raise ValueError("Validation dataset produced no media eval samples")
+
+    available_clip_ids: list[str] = []
+    seen: set[str] = set()
+    for clip_id in all_clip_ids:
+        if clip_id not in seen:
+            available_clip_ids.append(clip_id)
+            seen.add(clip_id)
+
+    if requested_clip_ids:
+        missing = [clip_id for clip_id in requested_clip_ids if clip_id not in seen]
+        if missing:
+            raise ValueError(f"media_eval_clip_ids not found in validation split: {missing}")
+        selected_clip_ids = requested_clip_ids
+    else:
+        selected_clip_ids = tuple(available_clip_ids[:clip_count])
+    if not selected_clip_ids:
+        raise ValueError("No validation clips selected for media eval")
+
+    selected_set = set(selected_clip_ids)
+    counts = {clip_id: 0 for clip_id in selected_clip_ids}
+    indices: list[int] = []
+    for index, clip_id in enumerate(all_clip_ids):
+        if clip_id not in selected_set or counts[clip_id] >= max_frames_per_clip:
+            continue
+        indices.append(index)
+        counts[clip_id] += 1
+        if all(count >= max_frames_per_clip for count in counts.values()):
+            break
+    if not indices:
+        raise ValueError("No validation frames selected for media eval")
+    return MediaEvalSelection(
+        dataset=Subset(dataset, indices),
+        clip_ids=selected_clip_ids,
+        indices=tuple(indices),
+    )
+
+
 def write_model_card(run_dir: str | Path, *, provenance: dict[str, Any]) -> Path:
     dataset = provenance.get("dataset", {})
     wandb = provenance.get("wandb", {})
@@ -359,6 +449,51 @@ def _checkpoint_payload(
         init_weight_source=init_weight_source,
         provenance=provenance,
     )
+
+
+def _render_best_media_eval(
+    *,
+    model: torch.nn.Module,
+    selection: MediaEvalSelection,
+    run_dir: Path,
+    best_path: Path,
+    device: torch.device,
+    step: int,
+    fps: float,
+    tracker: Any,
+) -> dict[str, Any]:
+    out_dir = run_dir / "media_eval" / f"step_{step:07d}_best"
+    artifacts = render_validation_artifacts(
+        model=model,
+        dataset=selection.dataset,
+        out_dir=out_dir,
+        checkpoint_path=best_path,
+        device=device,
+        max_batches=len(selection.indices),
+        fps=fps,
+    )
+    metadata_path = Path(str(artifacts["metadata_path"]))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "media_eval_clip_ids": list(selection.clip_ids),
+            "media_eval_indices": list(selection.indices),
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    caption = f"best.pt step={step} clips={','.join(selection.clip_ids)}"
+    tracker.log_video(
+        "media_eval/best_validation_grids",
+        str(artifacts["video_path"]),
+        step=step,
+        caption=caption,
+    )
+    return {
+        **artifacts,
+        "step": step,
+        "clip_ids": list(selection.clip_ids),
+        "indices": list(selection.indices),
+    }
 
 
 def _dataset_fingerprints(dataset: Any) -> dict[str, str]:
@@ -436,9 +571,21 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
     if config.log_interval < 0:
         raise ValueError("log_interval must be >= 0")
+    if config.media_eval_on_best and config.media_eval_fps <= 0:
+        raise ValueError("media_eval_fps must be positive")
     run_dir = Path(config.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     prepared_data = prepare_training_datasets(config, run_dir=run_dir)
+    media_eval_selection = (
+        build_media_eval_selection(
+            prepared_data.val_dataset,
+            clip_count=config.media_eval_clip_count,
+            clip_ids=tuple(config.media_eval_clip_ids),
+            max_frames_per_clip=config.media_eval_max_frames_per_clip,
+        )
+        if config.media_eval_on_best
+        else None
+    )
     dataset_root = prepared_data.dataset_root
     manifest_path = prepared_data.manifest_path
     device = resolve_device(config.device)
@@ -447,6 +594,13 @@ def train(config: TrainConfig) -> Path:
         "dataset": prepared_data.provenance,
         "init_model": init_weight_source,
     }
+    if media_eval_selection is not None:
+        provenance["media_eval"] = {
+            "on_best": True,
+            "clip_ids": list(media_eval_selection.clip_ids),
+            "indices": list(media_eval_selection.indices),
+            "max_frames_per_clip": config.media_eval_max_frames_per_clip,
+        }
     tracker = create_tracker(
         _wandb_config(config),
         run_config=asdict(config),
@@ -476,6 +630,7 @@ def train(config: TrainConfig) -> Path:
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
 
         metrics: list[dict[str, float | int | str]] = []
+        media_eval_artifacts: list[dict[str, Any]] = []
         best_val = float("inf")
         best_path = run_dir / "best.pt"
         step = 0
@@ -543,6 +698,19 @@ def train(config: TrainConfig) -> Path:
                             ),
                             best_path,
                         )
+                        if media_eval_selection is not None:
+                            media_eval_artifacts.append(
+                                _render_best_media_eval(
+                                    model=model,
+                                    selection=media_eval_selection,
+                                    run_dir=run_dir,
+                                    best_path=best_path,
+                                    device=device,
+                                    step=step,
+                                    fps=config.media_eval_fps,
+                                    tracker=tracker,
+                                )
+                            )
                 if step % config.checkpoint_interval == 0:
                     atomic_torch_save(
                         _checkpoint_payload(
@@ -607,10 +775,21 @@ def train(config: TrainConfig) -> Path:
             final_checkpoint=final_path,
         )
         write_model_card(run_dir, provenance=provenance)
+        if media_eval_artifacts:
+            media_eval_index_path = run_dir / "media_eval" / "index.json"
+            media_eval_index_path.parent.mkdir(parents=True, exist_ok=True)
+            media_eval_index_path.write_text(
+                json.dumps(media_eval_artifacts, indent=2),
+                encoding="utf-8",
+            )
         summary: dict[str, Any] = {
             "best_checkpoint": str(best_path.resolve()),
             "final_checkpoint": str(final_path.resolve()),
         }
+        if media_eval_artifacts:
+            latest_media_eval = media_eval_artifacts[-1]
+            summary["best_media_eval_video"] = latest_media_eval["video_path"]
+            summary["best_media_eval_metadata"] = latest_media_eval["metadata_path"]
         if best_val != float("inf"):
             summary["best_val_reconstruction_loss"] = best_val
         if config.hf_model_repo:

@@ -28,10 +28,16 @@ class _FakeWandb(ModuleType):
         super().__init__("wandb")
         self.run = _FakeRun()
         self.init_calls: list[dict[str, Any]] = []
+        self.videos: list[dict[str, Any]] = []
 
     def init(self, **kwargs: Any) -> _FakeRun:
         self.init_calls.append(kwargs)
         return self.run
+
+    def Video(self, path: str, *, format: str, caption: str = "") -> dict[str, str]:  # noqa: N802
+        video = {"path": path, "format": format, "caption": caption}
+        self.videos.append(video)
+        return video
 
 
 def test_disabled_tracker_does_not_import_wandb(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -112,3 +118,33 @@ def test_wandb_tracker_initializes_logs_summary_and_finish(
     assert fake.run.logged == [({"train_loss": 0.5}, 1)]
     assert fake.run.summary == {"best_val": 0.25}
     assert fake.run.exit_codes == [1]
+
+
+def test_wandb_tracker_logs_video_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    from edge_lipsync.tracking import WandbConfig, create_tracker
+
+    fake = _FakeWandb()
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+
+    tracker = create_tracker(WandbConfig(mode="offline"), run_config={}, provenance={})
+    tracker.log_video("media_eval/best_validation_grids", "/tmp/validation_grids.mp4", step=7)
+
+    assert fake.videos == [
+        {
+            "path": "/tmp/validation_grids.mp4",
+            "format": "mp4",
+            "caption": "",
+        }
+    ]
+    assert fake.run.logged == [
+        (
+            {
+                "media_eval/best_validation_grids": {
+                    "path": "/tmp/validation_grids.mp4",
+                    "format": "mp4",
+                    "caption": "",
+                }
+            },
+            7,
+        )
+    ]

@@ -280,6 +280,164 @@ def test_write_model_card_links_dataset_and_wandb(tmp_path: Path) -> None:
     assert "https://wandb.ai/owner/project/runs/run-id" in text
 
 
+def test_build_media_eval_selection_uses_first_val_clips_with_frame_limit() -> None:
+    import edge_lipsync.training as training
+
+    class ClipDataset:
+        clip_ids = ("clip-a", "clip-a", "clip-a", "clip-b", "clip-b", "clip-c")
+
+        def __len__(self) -> int:
+            return len(self.clip_ids)
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            return {"meta": {"clip_id": self.clip_ids[index]}}
+
+    selection = training.build_media_eval_selection(
+        ClipDataset(),
+        clip_count=2,
+        clip_ids=(),
+        max_frames_per_clip=2,
+    )
+
+    assert selection.clip_ids == ("clip-a", "clip-b")
+    assert selection.indices == (0, 1, 3, 4)
+    assert len(selection.dataset) == 4
+
+
+def test_train_renders_and_logs_media_eval_when_best_checkpoint_improves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    rendered: list[dict[str, Any]] = []
+
+    class TinyDataset:
+        clip_ids = ("clip-a", "clip-a", "clip-a", "clip-b", "clip-b", "clip-c")
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return len(self.clip_ids)
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+                "meta": {"clip_id": self.clip_ids[index]},
+            }
+
+    class FakeTracker:
+        def __init__(self) -> None:
+            self.videos: list[dict[str, Any]] = []
+            self.metrics: list[tuple[dict[str, Any], int]] = []
+            self.summary: dict[str, Any] = {}
+            self.exit_codes: list[int] = []
+
+        @property
+        def provenance(self) -> dict[str, str]:
+            return {"mode": "offline", "run_id": "run-id", "run_url": "run-url"}
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            self.metrics.append((metrics, step))
+
+        def log_video(self, name: str, path: str | Path, *, step: int, caption: str = "") -> None:
+            self.videos.append(
+                {
+                    "name": name,
+                    "path": str(Path(path)),
+                    "step": step,
+                    "caption": caption,
+                }
+            )
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            self.summary.update(values)
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+
+    def fake_render_validation_artifacts(**kwargs: Any) -> dict[str, Any]:
+        out_dir = Path(kwargs["out_dir"])
+        rendered.append(
+            {
+                "indices": tuple(kwargs["dataset"].indices),
+                "out_dir": out_dir,
+                "checkpoint_path": Path(kwargs["checkpoint_path"]),
+            }
+        )
+        video_path = out_dir / "validation_grids.mp4"
+        metadata_path = out_dir / "validation_grids.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text("{}", encoding="utf-8")
+        return {
+            "video_path": str(video_path),
+            "metadata_path": str(metadata_path),
+            "grid_paths": [],
+            "metrics": {"val_reconstruction_loss": 0.5},
+        }
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(training, "render_validation_artifacts", fake_render_validation_artifacts)
+
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(run_dir),
+        init_bin="/tmp/dh_model.bin",
+        device="cpu",
+        max_steps=1,
+        warmup_steps=0,
+        stabilization_steps=0,
+        validation_interval=1,
+        checkpoint_interval=1,
+        media_eval_on_best=True,
+        media_eval_clip_count=2,
+        media_eval_max_frames_per_clip=2,
+    )
+
+    training.train(config)
+
+    assert rendered == [
+        {
+            "indices": (0, 1, 3, 4),
+            "out_dir": run_dir / "media_eval" / "step_0000001_best",
+            "checkpoint_path": run_dir / "best.pt",
+        }
+    ]
+    assert tracker.videos == [
+        {
+            "name": "media_eval/best_validation_grids",
+            "path": str(run_dir / "media_eval" / "step_0000001_best" / "validation_grids.mp4"),
+            "step": 1,
+            "caption": "best.pt step=1 clips=clip-a,clip-b",
+        }
+    ]
+
+
 def test_train_logs_writes_final_artifacts_and_publishes_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,6 +541,7 @@ def test_train_logs_writes_final_artifacts_and_publishes_model(
         stabilization_steps=0,
         validation_interval=1,
         checkpoint_interval=1,
+        media_eval_on_best=False,
     )
 
     best = training.train(config)
@@ -451,6 +610,7 @@ def test_train_prints_progress_rows(
         validation_interval=1,
         checkpoint_interval=1,
         log_interval=1,
+        media_eval_on_best=False,
     )
 
     training.train(config)
@@ -531,6 +691,7 @@ def test_train_finishes_tracker_with_error_code_when_step_fails(
         max_steps=1,
         warmup_steps=0,
         stabilization_steps=0,
+        media_eval_on_best=False,
     )
 
     with pytest.raises(RuntimeError, match="simulated"):

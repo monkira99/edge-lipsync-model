@@ -234,6 +234,12 @@ config, step, epoch, metrics, initialization source, dataset provenance, and W&B
 The train loop also prints concise progress rows to stdout every `log_interval` steps and whenever
 validation runs, which is useful in Colab notebooks.
 
+When `media_eval_on_best` is enabled, every new `best.pt` renders a validation grid MP4 from the
+first `media_eval_clip_count` unique clips in the validation split. The selected clip IDs and frame
+indices are recorded in run provenance, local videos are written under `media_eval/`, and W&B logs
+the MP4 when tracking is enabled. Set `media_eval_clip_ids` to pin exact validation clips instead of
+using the first clips.
+
 The example config uses local paths. To train from a Hugging Face dataset, set:
 
 ```yaml
@@ -261,7 +267,7 @@ hf_model_private: true
 
 Supported W&B modes are `disabled`, `offline`, and `online`. Local metrics remain available in
 all modes. W&B records configuration, per-step losses, validation metrics, phase, learning rate,
-Hub provenance, console output, and native system telemetry.
+Hub provenance, best-checkpoint validation MP4s, console output, and native system telemetry.
 
 Model publication is optional. When `hf_model_repo` is set, successful training uploads
 `best.pt`, `final.pt`, metric curves, run metadata, and the generated model card. Uploads create
