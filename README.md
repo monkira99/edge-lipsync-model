@@ -32,7 +32,6 @@ Large reusable assets are stored on Hugging Face instead of GitHub:
 
 ```text
 tiennguyenbnbk/edge-lipsync-model-assets
-revision: 9a2ee098b0af5a714141e50911591e3ab29fcf4d
 ```
 
 The repository is private. Authenticate with Hugging Face before downloading:
@@ -41,7 +40,6 @@ The repository is private. Authenticate with Hugging Face before downloading:
 hf auth login
 .venv/bin/python tools/hf_model_assets.py pull \
   --repo-id tiennguyenbnbk/edge-lipsync-model-assets \
-  --revision 9a2ee098b0af5a714141e50911591e3ab29fcf4d \
   --local-dir models
 ```
 
@@ -101,10 +99,10 @@ progress bars in CI logs.
 
 Use `tools/build_hf_video_dataset.py` for HF datasets that already contain synced MP4 clips. This
 fits `Pinch-Research/lipsync-hdtf-training-data` because the teacher videos live under
-`xdub_teacher_pairs/videos/` and already include muxed audio. Use a pinned dataset revision and
-start with `--dry-run` plus `--max-videos`. The adapter downloads only selected videos, one file at
-a time through Hugging Face `datasets.load_dataset()` instead of building a Hub snapshot. Video
-decoding stays disabled while the adapter links the cached local MP4 paths into its work directory.
+`xdub_teacher_pairs/videos/` and already include muxed audio. Start with `--dry-run` plus
+`--max-videos`. The adapter downloads only selected videos, one file at a time through Hugging Face
+`datasets.load_dataset()`. Video decoding stays disabled while the adapter links the cached local
+MP4 paths into its work directory.
 The datasets downloader is limited to one worker by default; adjust `--download-max-workers` only
 when the Hub endpoint can handle additional concurrency. Authenticate with `HF_TOKEN` before large
 downloads so the Hub does not apply the lower anonymous resolver quota.
@@ -115,7 +113,6 @@ download starts.
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
   --repo-id Pinch-Research/lipsync-hdtf-training-data \
-  --revision pinned_dataset_commit_sha \
   --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
   --work-dir /absolute/path/to/work/hdtf_xdub \
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
@@ -131,7 +128,6 @@ List available speakers and clip counts:
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
   --repo-id Pinch-Research/lipsync-hdtf-training-data \
-  --revision pinned_dataset_commit_sha \
   --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
   --work-dir /absolute/path/to/work/hdtf_xdub \
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
@@ -145,7 +141,6 @@ Build all available clips for one speaker by setting `--max-videos 0`:
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
   --repo-id Pinch-Research/lipsync-hdtf-training-data \
-  --revision pinned_dataset_commit_sha \
   --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
   --work-dir /absolute/path/to/work/hdtf_xdub \
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
@@ -157,13 +152,11 @@ Build all available clips for one speaker by setting `--max-videos 0`:
 ```
 
 When the selected subset looks correct, remove `--dry-run`. Add `--push` to publish the processed
-dataset snapshot after the build. Dataset uploads use Hugging Face `upload_large_folder()` so large
-processed datasets can resume and commit in smaller batches.
+dataset as a Hugging Face `DatasetDict` with `push_to_hub()`.
 
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
   --repo-id Pinch-Research/lipsync-hdtf-training-data \
-  --revision pinned_dataset_commit_sha \
   --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
   --work-dir /absolute/path/to/work/hdtf_xdub \
   --wenet-onnx /absolute/path/to/models/wenet.onnx \
@@ -219,16 +212,14 @@ Upload a built dataset after inspecting its `build_summary.json` and previews:
 ```
 
 Uploads create private dataset repositories by default. Pass `--public` only when the dataset is
-intended to be public. Dataset uploads include the manifest, splits, quality metadata, previews,
-frames, bboxes, and BNF arrays. They exclude raw source videos and the normalized intermediate
-`audio.wav` and `video_25fps.mkv` files.
+intended to be public. Dataset uploads store train/val splits as native Hugging Face datasets with
+frame images, bbox metadata, BNF audio windows, and flags.
 
-Pull a pinned revision into the Hugging Face local cache:
+Load a processed dataset through Hugging Face `datasets`:
 
 ```bash
 .venv/bin/python tools/hf_dataset.py pull \
-  --repo-id username/avatar-name-dataset \
-  --revision dataset-v1
+  --repo-id username/avatar-name-dataset
 ```
 
 ## Train
@@ -239,27 +230,20 @@ Pull a pinned revision into the Hugging Face local cache:
 
 Training writes atomic checkpoints, `best.pt`, `final.pt`, `metrics.json`, `metrics.csv`,
 `run_metadata.json`, and a model card. Checkpoints include the dataset manifest hash, training
-config, step, epoch, metrics, initialization source, dataset revision, and W&B run provenance.
+config, step, epoch, metrics, initialization source, dataset provenance, and W&B run provenance.
 
-The example config uses local paths. To train from a Hugging Face dataset revision, clear
-`dataset_root` and set:
+The example config uses local paths. To train from a Hugging Face dataset, set:
 
 ```yaml
-dataset_root: ""
 hf_dataset_repo: username/avatar-name-dataset
-hf_dataset_revision: dataset-v1
 ```
 
-Hub dataset inputs require a non-empty pinned revision. Training will not silently consume a
-moving default branch.
-
-To initialize from a Hugging Face model revision instead of `init_bin` or `init_ckpt`, set:
+To initialize from a Hugging Face model instead of `init_bin` or `init_ckpt`, set:
 
 ```yaml
 init_bin: ""
 init_ckpt: ""
 hf_init_model_repo: username/avatar-name-model
-hf_init_model_revision: baseline-v1
 hf_init_model_filename: best.pt
 ```
 
@@ -288,12 +272,11 @@ can be retried:
   --repo-id username/avatar-name-model
 ```
 
-Pull a historical model checkpoint by revision:
+Pull a model checkpoint:
 
 ```bash
 .venv/bin/python tools/hf_model.py pull \
   --repo-id username/avatar-name-model \
-  --revision model-v1 \
   --filename best.pt
 ```
 
@@ -306,16 +289,12 @@ Pull a historical model checkpoint by revision:
 The render command writes prediction grids, `validation_grids.mp4`, numeric validation metrics,
 and JSON metadata next to the video.
 
-The eval config also supports pinned Hub dataset and model inputs. Clear `dataset_root` and
-`ckpt`, then set:
+The eval config also supports Hub dataset and model inputs. Set:
 
 ```yaml
-dataset_root: ""
 ckpt: ""
 hf_dataset_repo: username/avatar-name-dataset
-hf_dataset_revision: dataset-v1
 hf_model_repo: username/avatar-name-model
-hf_model_revision: model-v1
 hf_model_filename: best.pt
 ```
 

@@ -83,3 +83,20 @@ def test_dataset_rejects_empty_split(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="No records"):
         DuixManifestDataset(tmp_path, manifest, split="val")
+
+
+def test_duix_hf_dataset_loads_sample_from_datasets_row(tmp_path: Path) -> None:
+    from edge_lipsync.dataset import DuixHFDataset
+    from edge_lipsync.hf_datasets import build_processed_dataset_dict
+
+    _write_fixture_dataset(tmp_path)
+    dataset_dict = build_processed_dataset_dict(tmp_path)
+
+    ds = DuixHFDataset(dataset_dict, split="train")
+    sample = ds[0]
+
+    assert len(ds) == 1
+    assert tuple(sample["face"].shape) == (6, 160, 160)
+    assert tuple(sample["audio"].shape) == (20, 256)
+    assert tuple(sample["target"].shape) == (3, 160, 160)
+    assert sample["meta"]["clip_id"] == "clip_001"

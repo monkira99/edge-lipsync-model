@@ -21,7 +21,8 @@ from datasets import (
 )
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset
-from edge_lipsync.hub import HfApi, hf_hub_download, push_dataset_snapshot
+from edge_lipsync.hf_datasets import push_processed_dataset
+from edge_lipsync.hub import HfApi, hf_hub_download
 from edge_lipsync.progress import progress
 
 DEFAULT_VIDEO_PREFIX = "xdub_teacher_pairs/videos"
@@ -38,7 +39,6 @@ class HfVideoFileSelection:
 @dataclass(frozen=True)
 class HfVideoDatasetBuildConfig:
     repo_id: str
-    revision: str
     dataset_root: str
     wenet_onnx: str
     video_prefix: str = DEFAULT_VIDEO_PREFIX
@@ -71,14 +71,12 @@ class HfVideoDatasetBuildConfig:
     push: bool = False
     hf_output_repo_id: str = ""
     private: bool = True
-    commit_message: str = "Upload processed HF video dataset snapshot"
     strict: bool = False
 
 
 @dataclass(frozen=True)
 class HfVideoDatasetBuildResult:
     repo_id: str
-    requested_revision: str
     dataset_root: Path
     work_dir: Path
     raw_video_dir: Path
@@ -88,7 +86,6 @@ class HfVideoDatasetBuildResult:
     selected_video_files: list[str]
     speaker_id: str = ""
     speaker_counts: dict[str, int] | None = None
-    pushed_revision: str | None = None
     hub_url: str | None = None
     build_summary: dict[str, Any] | None = None
 
@@ -99,11 +96,6 @@ def _client(api: Any | None) -> Any:
     if HfApi is None:
         raise ImportError("Install huggingface-hub to use Hugging Face dataset integration")
     return HfApi()
-
-
-def _require_revision(revision: str) -> None:
-    if not revision:
-        raise ValueError("Hugging Face dataset revision must be pinned and non-empty")
 
 
 def _normalized_prefix(prefix: str) -> str:
@@ -130,17 +122,16 @@ def _video_path_for_metadata_entry(entry: dict[str, Any], video_root: str) -> st
 def load_hf_video_metadata_manifest(
     *,
     repo_id: str,
-    revision: str,
     metadata_manifest: str = DEFAULT_METADATA_MANIFEST,
     cache_dir: str = "",
 ) -> list[dict[str, Any]]:
-    path = hf_hub_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        revision=revision,
-        filename=metadata_manifest,
-        cache_dir=cache_dir or None,
-    )
+    kwargs = {
+        "repo_id": repo_id,
+        "repo_type": "dataset",
+        "filename": metadata_manifest,
+        "cache_dir": cache_dir or None,
+    }
+    path = hf_hub_download(**kwargs)
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise ValueError(f"Expected {metadata_manifest} to contain a JSON list")
@@ -222,7 +213,6 @@ def _limited_datasets_download_workers(max_workers: int) -> Iterator[None]:
 
 def download_hf_video_files(
     repo_id: str,
-    revision: str,
     video_files: list[str],
     raw_video_dir: str | Path,
     *,
@@ -248,7 +238,6 @@ def download_hf_video_files(
             repo_id,
             data_files={"train": video_files},
             split="train",
-            revision=revision,
             cache_dir=cache_dir or None,
             features=Features({"video": Video(decode=False)}),
             download_config=download_config,
@@ -308,7 +297,6 @@ def build_hf_video_dataset(
     *,
     api: Any | None = None,
 ) -> HfVideoDatasetBuildResult:
-    _require_revision(config.revision)
     if config.download_max_workers < 1:
         raise ValueError("download_max_workers must be >= 1")
     if (
@@ -325,13 +313,11 @@ def build_hf_video_dataset(
     repo_files = client.list_repo_files(
         repo_id=config.repo_id,
         repo_type="dataset",
-        revision=config.revision,
     )
     metadata_entries = None
     if config.speaker_id or config.list_speakers:
         metadata_entries = load_hf_video_metadata_manifest(
             repo_id=config.repo_id,
-            revision=config.revision,
             metadata_manifest=config.metadata_manifest,
             cache_dir=config.cache_dir,
         )
@@ -345,13 +331,11 @@ def build_hf_video_dataset(
     if not selection.video_files:
         speaker_note = f" for speaker_id={config.speaker_id!r}" if config.speaker_id else ""
         raise ValueError(
-            f"No video files found in {config.repo_id}@{config.revision} "
-            f"under {config.video_prefix!r}{speaker_note}"
+            f"No video files found in {config.repo_id} under {config.video_prefix!r}{speaker_note}"
         )
     if config.dry_run or config.list_speakers:
         return HfVideoDatasetBuildResult(
             repo_id=config.repo_id,
-            requested_revision=config.revision,
             dataset_root=dataset_root,
             work_dir=work_dir,
             raw_video_dir=raw_video_dir,
@@ -365,7 +349,6 @@ def build_hf_video_dataset(
 
     raw_video_paths = download_hf_video_files(
         config.repo_id,
-        config.revision,
         selection.video_files,
         raw_video_dir,
         cache_dir=config.cache_dir,
@@ -376,21 +359,17 @@ def build_hf_video_dataset(
         _dataset_config(config, raw_video_dir),
         strict=config.strict,
     )
-    pushed_revision: str | None = None
     hub_url: str | None = None
     if config.push:
-        artifact = push_dataset_snapshot(
+        artifact = push_processed_dataset(
             dataset_root,
             config.hf_output_repo_id,
             private=config.private,
-            commit_message=config.commit_message,
         )
-        pushed_revision = artifact.resolved_revision
         hub_url = artifact.url
 
     return HfVideoDatasetBuildResult(
         repo_id=config.repo_id,
-        requested_revision=config.revision,
         dataset_root=dataset_root,
         work_dir=work_dir,
         raw_video_dir=raw_video_dir,
@@ -400,7 +379,6 @@ def build_hf_video_dataset(
         selected_video_files=selection.video_files,
         speaker_id=config.speaker_id,
         speaker_counts=selection.speaker_counts,
-        pushed_revision=pushed_revision,
         hub_url=hub_url,
         build_summary=build_summary,
     )

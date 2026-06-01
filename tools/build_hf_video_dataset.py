@@ -21,7 +21,6 @@ def main() -> None:
         description="Build a Duix dataset from videos stored in a Hugging Face dataset."
     )
     parser.add_argument("--repo-id", required=True, help="Hugging Face dataset repo id")
-    parser.add_argument("--revision", required=True, help="Pinned Hugging Face dataset revision")
     parser.add_argument("--dataset-root", required=True, help="Output processed dataset directory")
     parser.add_argument("--work-dir", default="", help="Intermediate work directory")
     parser.add_argument("--cache-dir", default="", help="Hugging Face cache directory")
@@ -85,11 +84,6 @@ def main() -> None:
     privacy = parser.add_mutually_exclusive_group()
     privacy.add_argument("--private", action="store_true", help="Create/use a private output repo")
     privacy.add_argument("--public", action="store_true", help="Create/use a public output repo")
-    parser.add_argument(
-        "--commit-message",
-        default="Upload processed HF video dataset snapshot",
-        help="Commit message for processed dataset upload",
-    )
     args = parser.parse_args()
     if args.push and not args.dry_run and not args.list_speakers and not args.hf_output_repo_id:
         parser.error("--hf-output-repo-id is required when --push is set")
@@ -97,7 +91,6 @@ def main() -> None:
     result = build_hf_video_dataset(
         HfVideoDatasetBuildConfig(
             repo_id=args.repo_id,
-            revision=args.revision,
             dataset_root=args.dataset_root,
             work_dir=args.work_dir,
             cache_dir=args.cache_dir,
@@ -119,14 +112,12 @@ def main() -> None:
             push=args.push,
             hf_output_repo_id=args.hf_output_repo_id,
             private=not args.public,
-            commit_message=args.commit_message,
             strict=args.strict,
         )
     )
 
     print(f"dry_run={result.dry_run}")
     print(f"repo_id={result.repo_id}")
-    print(f"revision={result.requested_revision}")
     print(f"dataset_root={result.dataset_root.resolve()}")
     print(f"work_dir={result.work_dir.resolve()}")
     print(f"raw_video_dir={result.raw_video_dir.resolve()}")
@@ -144,8 +135,6 @@ def main() -> None:
         )
         for speaker_id, count in speaker_rows:
             print(f"{speaker_id}\t{count}")
-    if result.pushed_revision is not None:
-        print(f"processed_revision={result.pushed_revision}")
     if result.hub_url is not None:
         print(f"url={result.hub_url}")
 

@@ -11,7 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
-from edge_lipsync.dataset import DuixManifestDataset, manifest_sha256
+from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset, manifest_sha256
+from edge_lipsync.hf_datasets import load_processed_dataset
 from edge_lipsync.hub import push_model_artifacts
 from edge_lipsync.losses import (
     charbonnier_loss,
@@ -25,9 +26,9 @@ from edge_lipsync.tracking import WandbConfig, create_tracker
 
 @dataclass(frozen=True)
 class TrainConfig:
-    dataset_root: str
-    manifest: str
     run_dir: str
+    dataset_root: str = ""
+    manifest: str = "manifest.jsonl"
     init_bin: str = ""
     init_ckpt: str = ""
     device: str = "auto"
@@ -43,10 +44,8 @@ class TrainConfig:
     validation_interval: int = 100
     checkpoint_interval: int = 100
     hf_dataset_repo: str = ""
-    hf_dataset_revision: str = ""
     hf_cache_dir: str = ""
     hf_init_model_repo: str = ""
-    hf_init_model_revision: str = ""
     hf_init_model_filename: str = "best.pt"
     hf_model_repo: str = ""
     hf_model_private: bool = True
@@ -58,6 +57,15 @@ class TrainConfig:
     wandb_tags: tuple[str, ...] = ()
     wandb_notes: str = ""
     wandb_dir: str = ""
+
+
+@dataclass(frozen=True)
+class PreparedTrainingDatasets:
+    train_dataset: Any
+    val_dataset: Any
+    dataset_root: Path
+    manifest_path: Path
+    provenance: dict[str, Any]
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -206,7 +214,6 @@ def build_model(config: TrainConfig, device: torch.device) -> tuple[DuixUNet, di
         resolved = resolve_model_source(
             checkpoint=config.init_ckpt,
             hf_repo=config.hf_init_model_repo,
-            hf_revision=config.hf_init_model_revision,
             hf_filename=config.hf_init_model_filename,
             cache_dir=config.hf_cache_dir,
         )
@@ -259,6 +266,7 @@ def write_model_card(run_dir: str | Path, *, provenance: dict[str, Any]) -> Path
     dataset = provenance.get("dataset", {})
     wandb = provenance.get("wandb", {})
     model = provenance.get("model", {})
+    dataset_ref = dataset.get("fingerprints") or dataset.get("resolved_ref", "")
     lines = [
         "# Edge Lip-Sync Duix UNet Checkpoint",
         "",
@@ -268,10 +276,10 @@ def write_model_card(run_dir: str | Path, *, provenance: dict[str, Any]) -> Path
         "",
         f"- Dataset source: `{dataset.get('source', '')}`",
         f"- Dataset repository: `{dataset.get('repo_id', '')}`",
-        f"- Dataset revision: `{dataset.get('resolved_revision', '')}`",
+        f"- Dataset ref/fingerprints: `{dataset_ref}`",
         f"- W&B run: {wandb.get('run_url', '')}",
         f"- Model repository: `{model.get('repo_id', '')}`",
-        f"- Model revision: `{model.get('resolved_revision', '')}`",
+        f"- Model resolved ref: `{model.get('resolved_ref', '')}`",
         "",
     ]
     output = Path(run_dir) / "README.md"
@@ -320,6 +328,74 @@ def _checkpoint_payload(
     )
 
 
+def _dataset_fingerprints(dataset: Any) -> dict[str, str]:
+    if not hasattr(dataset, "items"):
+        return {}
+    fingerprints: dict[str, str] = {}
+    for split, split_dataset in dataset.items():
+        fingerprint = getattr(split_dataset, "_fingerprint", "")
+        if fingerprint:
+            fingerprints[str(split)] = str(fingerprint)
+    return fingerprints
+
+
+def _write_hf_dataset_source(run_dir: Path, provenance: dict[str, Any]) -> Path:
+    path = run_dir / "hf_dataset_source.json"
+    path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
+    return path
+
+
+def prepare_training_datasets(
+    config: TrainConfig,
+    *,
+    run_dir: str | Path | None = None,
+) -> PreparedTrainingDatasets:
+    if bool(config.dataset_root) == bool(config.hf_dataset_repo):
+        raise ValueError("Set exactly one of dataset_root or hf_dataset_repo")
+    if config.hf_dataset_repo:
+        dataset = load_processed_dataset(config.hf_dataset_repo, cache_dir=config.hf_cache_dir)
+        provenance: dict[str, Any] = {
+            "source": "huggingface_datasets",
+            "repo_id": config.hf_dataset_repo,
+        }
+        fingerprints = _dataset_fingerprints(dataset)
+        if fingerprints:
+            provenance["fingerprints"] = fingerprints
+        metadata_dir = Path(run_dir) if run_dir is not None else Path(".")
+        if run_dir is not None:
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = _write_hf_dataset_source(metadata_dir, provenance)
+        else:
+            manifest_path = metadata_dir / "hf_dataset_source.json"
+        return PreparedTrainingDatasets(
+            train_dataset=DuixHFDataset(dataset, split="train"),
+            val_dataset=DuixHFDataset(dataset, split="val"),
+            dataset_root=metadata_dir,
+            manifest_path=manifest_path,
+            provenance=provenance,
+        )
+
+    dataset_source = resolve_dataset_source(
+        dataset_root=config.dataset_root,
+        hf_repo="",
+        cache_dir=config.hf_cache_dir,
+    )
+    dataset_root = dataset_source.path
+    manifest_path = Path(config.manifest)
+    if not manifest_path.is_absolute():
+        manifest_path = dataset_root / manifest_path
+    return PreparedTrainingDatasets(
+        train_dataset=DuixManifestDataset(dataset_root, manifest_path, split="train"),
+        val_dataset=DuixManifestDataset(dataset_root, manifest_path, split="val"),
+        dataset_root=dataset_root,
+        manifest_path=manifest_path,
+        provenance={
+            **dataset_source.provenance,
+            "manifest_sha256": manifest_sha256(manifest_path),
+        },
+    )
+
+
 def train(config: TrainConfig) -> Path:
     if config.max_steps <= 0:
         raise ValueError("max_steps must be positive")
@@ -327,23 +403,13 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
     run_dir = Path(config.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    dataset_source = resolve_dataset_source(
-        dataset_root=config.dataset_root,
-        hf_repo=config.hf_dataset_repo,
-        hf_revision=config.hf_dataset_revision,
-        cache_dir=config.hf_cache_dir,
-    )
-    dataset_root = dataset_source.path
-    manifest_path = Path(config.manifest)
-    if not manifest_path.is_absolute():
-        manifest_path = dataset_root / manifest_path
+    prepared_data = prepare_training_datasets(config, run_dir=run_dir)
+    dataset_root = prepared_data.dataset_root
+    manifest_path = prepared_data.manifest_path
     device = resolve_device(config.device)
     model, init_weight_source = build_model(config, device)
     provenance = {
-        "dataset": {
-            **dataset_source.provenance,
-            "manifest_sha256": manifest_sha256(manifest_path),
-        },
+        "dataset": prepared_data.provenance,
         "init_model": init_weight_source,
     }
     tracker = create_tracker(
@@ -354,16 +420,14 @@ def train(config: TrainConfig) -> Path:
     provenance["wandb"] = tracker.provenance
     try:
         mixed_precision = use_mixed_precision(config, device)
-        train_dataset = DuixManifestDataset(dataset_root, manifest_path, split="train")
-        val_dataset = DuixManifestDataset(dataset_root, manifest_path, split="val")
         train_loader = DataLoader(
-            train_dataset,
+            prepared_data.train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
         )
         val_loader = DataLoader(
-            val_dataset,
+            prepared_data.val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
@@ -517,7 +581,7 @@ def train(config: TrainConfig) -> Path:
             provenance["model"] = {
                 "source": "huggingface",
                 "repo_id": model_artifact.repo_id,
-                "resolved_revision": model_artifact.resolved_revision,
+                "resolved_ref": model_artifact.resolved_ref,
                 "url": model_artifact.url,
             }
             write_run_metadata(
@@ -528,7 +592,7 @@ def train(config: TrainConfig) -> Path:
             )
             write_model_card(run_dir, provenance=provenance)
             summary["hf_model_repo"] = model_artifact.repo_id
-            summary["hf_model_revision"] = model_artifact.resolved_revision
+            summary["hf_model_ref"] = model_artifact.resolved_ref
             summary["hf_model_url"] = model_artifact.url
         tracker.update_summary(summary)
     except Exception:

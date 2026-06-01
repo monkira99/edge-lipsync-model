@@ -23,9 +23,8 @@ def main() -> None:
     push.add_argument("--public", action="store_true")
     push.add_argument("--commit-message", default="Upload training run artifacts")
 
-    pull = subparsers.add_parser("pull", help="Download a pinned trained checkpoint")
+    pull = subparsers.add_parser("pull", help="Download a trained checkpoint")
     pull.add_argument("--repo-id", required=True)
-    pull.add_argument("--revision", required=True)
     pull.add_argument("--filename", default="best.pt")
     pull.add_argument("--cache-dir", default="")
 
@@ -40,12 +39,11 @@ def main() -> None:
     else:
         artifact = pull_model_checkpoint(
             args.repo_id,
-            revision=args.revision,
             filename=args.filename,
             cache_dir=args.cache_dir,
         )
     print(f"repo_id={artifact.repo_id}")
-    print(f"revision={artifact.resolved_revision}")
+    print(f"resolved_ref={artifact.resolved_ref}")
     print(f"url={artifact.url}")
     if artifact.path is not None:
         print(f"path={artifact.path.resolve()}")

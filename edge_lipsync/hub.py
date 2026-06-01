@@ -25,16 +25,6 @@ else:
     hf_hub_download = _download_file
 
 
-DATASET_UPLOAD_PATTERNS = (
-    "manifest.jsonl",
-    "splits.json",
-    "build_summary.json",
-    "clips/*/frames/*.png",
-    "clips/*/bnf.npy",
-    "clips/*/bboxes.json",
-    "clips/*/quality.json",
-    "clips/*/previews/*.jpg",
-)
 MODEL_UPLOAD_PATTERNS = (
     "best.pt",
     "final.pt",
@@ -49,7 +39,6 @@ MODEL_ASSET_UPLOAD_PATTERNS = (
     "mediapipe/*",
     "wenet/*",
 )
-DATASET_REQUIRED_PATHS = ("manifest.jsonl", "splits.json", "build_summary.json", "clips")
 MODEL_REQUIRED_PATHS = ("best.pt", "final.pt", "metrics.json", "metrics.csv", "run_metadata.json")
 MODEL_ASSET_REQUIRED_PATHS = (
     "duix_detector/pfpld_robust_sim_bs1_8003.onnx",
@@ -65,8 +54,8 @@ MODEL_ASSET_REQUIRED_PATHS = (
 @dataclass(frozen=True)
 class HubArtifact:
     repo_id: str
-    requested_revision: str
-    resolved_revision: str
+    requested_ref: str
+    resolved_ref: str
     path: Path | None = None
     url: str = ""
 
@@ -79,11 +68,6 @@ def _client(api: Any | None) -> Any:
     return HfApi()
 
 
-def _require_revision(revision: str) -> None:
-    if not revision:
-        raise ValueError("Hugging Face revision must be pinned and non-empty")
-
-
 def _validate_required_paths(root: Path, required: tuple[str, ...]) -> None:
     if not root.is_dir():
         raise FileNotFoundError(root)
@@ -93,60 +77,9 @@ def _validate_required_paths(root: Path, required: tuple[str, ...]) -> None:
             raise FileNotFoundError(f"Required artifact is missing: {path}")
 
 
-def _repo_url(repo_id: str, *, repo_type: str, revision: str) -> str:
+def _repo_url(repo_id: str, *, repo_type: str, ref: str) -> str:
     prefix = "datasets/" if repo_type == "dataset" else ""
-    return f"https://huggingface.co/{prefix}{repo_id}/tree/{revision}"
-
-
-def push_dataset_snapshot(
-    dataset_root: str | Path,
-    repo_id: str,
-    *,
-    private: bool = True,
-    commit_message: str = "Upload processed dataset snapshot",
-    api: Any | None = None,
-) -> HubArtifact:
-    root = Path(dataset_root)
-    _validate_required_paths(root, DATASET_REQUIRED_PATHS)
-    client = _client(api)
-    client.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
-    client.upload_large_folder(
-        folder_path=str(root),
-        repo_id=repo_id,
-        repo_type="dataset",
-        allow_patterns=DATASET_UPLOAD_PATTERNS,
-    )
-    info = client.dataset_info(repo_id=repo_id)
-    revision = str(info.sha)
-    return HubArtifact(
-        repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=revision,
-        url=_repo_url(repo_id, repo_type="dataset", revision=revision),
-    )
-
-
-def pull_dataset_snapshot(
-    repo_id: str,
-    *,
-    revision: str,
-    cache_dir: str = "",
-    api: Any | None = None,
-) -> HubArtifact:
-    _require_revision(revision)
-    kwargs = {"repo_id": repo_id, "repo_type": "dataset", "revision": revision}
-    if cache_dir:
-        kwargs["cache_dir"] = cache_dir
-    path = Path(snapshot_download(**kwargs))
-    info = _client(api).dataset_info(repo_id=repo_id, revision=revision)
-    resolved = str(info.sha)
-    return HubArtifact(
-        repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=resolved,
-        path=path,
-        url=_repo_url(repo_id, repo_type="dataset", revision=resolved),
-    )
+    return f"https://huggingface.co/{prefix}{repo_id}/tree/{ref}"
 
 
 def push_model_artifacts(
@@ -167,36 +100,40 @@ def push_model_artifacts(
         allow_patterns=MODEL_UPLOAD_PATTERNS,
         commit_message=commit_message,
     )
-    revision = str(commit.oid)
+    ref = str(commit.oid)
     return HubArtifact(
         repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=revision,
-        url=_repo_url(repo_id, repo_type="model", revision=revision),
+        requested_ref=ref,
+        resolved_ref=ref,
+        url=_repo_url(repo_id, repo_type="model", ref=ref),
     )
 
 
 def pull_model_checkpoint(
     repo_id: str,
     *,
-    revision: str,
+    ref: str = "",
     filename: str = "best.pt",
     cache_dir: str = "",
     api: Any | None = None,
 ) -> HubArtifact:
-    _require_revision(revision)
-    kwargs = {"repo_id": repo_id, "filename": filename, "revision": revision}
+    kwargs = {"repo_id": repo_id, "filename": filename}
+    if ref:
+        kwargs["revision"] = ref
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     path = Path(hf_hub_download(**kwargs))
-    info = _client(api).model_info(repo_id=repo_id, revision=revision)
+    info_kwargs = {"repo_id": repo_id}
+    if ref:
+        info_kwargs["revision"] = ref
+    info = _client(api).model_info(**info_kwargs)
     resolved = str(info.sha)
     return HubArtifact(
         repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=resolved,
+        requested_ref=ref,
+        resolved_ref=resolved,
         path=path,
-        url=_repo_url(repo_id, repo_type="model", revision=resolved),
+        url=_repo_url(repo_id, repo_type="model", ref=resolved),
     )
 
 
@@ -218,40 +155,43 @@ def push_model_assets(
         allow_patterns=MODEL_ASSET_UPLOAD_PATTERNS,
         commit_message=commit_message,
     )
-    revision = str(commit.oid)
+    ref = str(commit.oid)
     return HubArtifact(
         repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=revision,
-        url=_repo_url(repo_id, repo_type="model", revision=revision),
+        requested_ref=ref,
+        resolved_ref=ref,
+        url=_repo_url(repo_id, repo_type="model", ref=ref),
     )
 
 
 def pull_model_assets(
     repo_id: str,
     *,
-    revision: str,
+    ref: str = "",
     local_dir: str = "models",
     cache_dir: str = "",
     api: Any | None = None,
 ) -> HubArtifact:
-    _require_revision(revision)
     kwargs = {
         "repo_id": repo_id,
-        "revision": revision,
         "allow_patterns": MODEL_ASSET_UPLOAD_PATTERNS,
     }
+    if ref:
+        kwargs["revision"] = ref
     if local_dir:
         kwargs["local_dir"] = local_dir
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     path = Path(snapshot_download(**kwargs))
-    info = _client(api).model_info(repo_id=repo_id, revision=revision)
+    info_kwargs = {"repo_id": repo_id}
+    if ref:
+        info_kwargs["revision"] = ref
+    info = _client(api).model_info(**info_kwargs)
     resolved = str(info.sha)
     return HubArtifact(
         repo_id=repo_id,
-        requested_revision=revision,
-        resolved_revision=resolved,
+        requested_ref=ref,
+        resolved_ref=resolved,
         path=path,
-        url=_repo_url(repo_id, repo_type="model", revision=resolved),
+        url=_repo_url(repo_id, repo_type="model", ref=resolved),
     )

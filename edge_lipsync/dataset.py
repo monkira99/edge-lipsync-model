@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torch.utils.data import Dataset as TorchDataset
 
 from edge_lipsync.audio_features import get_bnf_window
 from edge_lipsync.preprocess import make_face_training_sample
@@ -114,5 +115,66 @@ class DuixManifestDataset(Dataset[dict[str, Any]]):
                 "frame_path": record.frame_path,
                 "bbox_xyxy": record.bbox_xyxy,
                 "flags": record.flags,
+            },
+        }
+
+
+def _hf_frame_to_bgr(frame: Any) -> np.ndarray:
+    if hasattr(frame, "convert"):
+        rgb = np.asarray(frame.convert("RGB"))
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    if isinstance(frame, dict):
+        path = frame.get("path")
+        if isinstance(path, str) and path:
+            image = cv2.imread(path, cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(path)
+            return image
+        data = frame.get("bytes")
+        if isinstance(data, bytes):
+            encoded = np.frombuffer(data, dtype=np.uint8)
+            image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("Cannot decode image bytes from Hugging Face dataset row")
+            return image
+    if isinstance(frame, np.ndarray):
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(f"Expected HWC RGB frame array, got {frame.shape}")
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    raise TypeError(f"Unsupported Hugging Face frame value: {type(frame)!r}")
+
+
+class DuixHFDataset(TorchDataset[dict[str, Any]]):
+    def __init__(self, dataset: Any, split: str) -> None:
+        if hasattr(dataset, "keys") and split in dataset:
+            dataset = dataset[split]
+        self.dataset = dataset
+        self.split = split
+        if len(self.dataset) == 0:
+            raise ValueError(f"No records for split={split!r} in Hugging Face dataset")
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = self.dataset[index]
+        bbox = tuple(int(value) for value in row["bbox_xyxy"])
+        if len(bbox) != 4:
+            raise ValueError(f"bbox_xyxy must have 4 values: {bbox}")
+        frame = _hf_frame_to_bgr(row["frame"])
+        audio = np.asarray(row["audio"], dtype=np.float32)
+        if audio.shape != (20, 256):
+            raise ValueError(f"Invalid audio shape={audio.shape}, expected=(20, 256)")
+        face_sample = make_face_training_sample(frame, bbox)
+        return {
+            "face": torch.from_numpy(face_sample.face),
+            "audio": torch.from_numpy(audio),
+            "target": torch.from_numpy(face_sample.target),
+            "meta": {
+                "clip_id": str(row["clip_id"]),
+                "frame_idx": int(row["frame_idx"]),
+                "audio_idx": int(row["audio_idx"]),
+                "bbox_xyxy": bbox,
+                "flags": tuple(str(value) for value in row.get("flags", [])),
             },
         }

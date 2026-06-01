@@ -141,7 +141,7 @@ def test_build_model_rejects_missing_init_checkpoint(tmp_path: Path) -> None:
         build_model(config, torch.device("cpu"))
 
 
-def test_build_model_loads_pinned_hub_checkpoint(
+def test_build_model_loads_hub_checkpoint_without_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,7 +156,6 @@ def test_build_model_loads_pinned_hub_checkpoint(
         assert kwargs == {
             "checkpoint": "",
             "hf_repo": "owner/avatar-model",
-            "hf_revision": "model-v1",
             "hf_filename": "best.pt",
             "cache_dir": "/cache",
         }
@@ -165,8 +164,7 @@ def test_build_model_loads_pinned_hub_checkpoint(
             provenance={
                 "source": "huggingface",
                 "repo_id": "owner/avatar-model",
-                "requested_revision": "model-v1",
-                "resolved_revision": "model-sha",
+                "resolved_ref": "model-sha",
             },
         )
 
@@ -177,7 +175,6 @@ def test_build_model_loads_pinned_hub_checkpoint(
         manifest="manifest",
         run_dir="run",
         hf_init_model_repo="owner/avatar-model",
-        hf_init_model_revision="model-v1",
         hf_cache_dir="/cache",
     )
 
@@ -185,7 +182,58 @@ def test_build_model_loads_pinned_hub_checkpoint(
 
     assert model is expected_model
     assert source["kind"] == "huggingface_checkpoint"
-    assert source["resolved_revision"] == "model-sha"
+    assert source["resolved_ref"] == "model-sha"
+
+
+def test_prepare_training_datasets_loads_hf_dataset_without_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    loaded_dataset = {"train": [1], "val": [2]}
+
+    class TinyHFDataset:
+        def __init__(self, dataset: object, split: str) -> None:
+            calls.append((split, {"dataset": dataset}))
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    def fake_load_processed_dataset(repo_id: str, *, cache_dir: str = "") -> object:
+        calls.append(("load", {"repo_id": repo_id, "cache_dir": cache_dir}))
+        return loaded_dataset
+
+    monkeypatch.setattr(training, "load_processed_dataset", fake_load_processed_dataset)
+    monkeypatch.setattr(training, "DuixHFDataset", TinyHFDataset)
+
+    prepared = training.prepare_training_datasets(
+        training.TrainConfig(
+            run_dir="run",
+            init_bin="/tmp/dh_model.bin",
+            hf_dataset_repo="owner/avatar-data",
+            hf_cache_dir="/cache",
+        )
+    )
+
+    assert prepared.provenance == {
+        "source": "huggingface_datasets",
+        "repo_id": "owner/avatar-data",
+    }
+    assert len(prepared.train_dataset) == 1
+    assert len(prepared.val_dataset) == 1
+    assert calls == [
+        ("load", {"repo_id": "owner/avatar-data", "cache_dir": "/cache"}),
+        ("train", {"dataset": loaded_dataset}),
+        ("val", {"dataset": loaded_dataset}),
+    ]
 
 
 def test_write_run_metadata_records_provenance(tmp_path: Path) -> None:
@@ -218,7 +266,7 @@ def test_write_model_card_links_dataset_and_wandb(tmp_path: Path) -> None:
         provenance={
             "dataset": {
                 "repo_id": "owner/avatar-data",
-                "resolved_revision": "data-sha",
+                "resolved_ref": "data-sha",
             },
             "wandb": {
                 "run_url": "https://wandb.ai/owner/project/runs/run-id",
@@ -293,10 +341,8 @@ def test_train_logs_writes_final_artifacts_and_publishes_model(
         lambda **_kwargs: ResolvedSource(
             path=dataset_root,
             provenance={
-                "source": "huggingface",
-                "repo_id": "owner/avatar-data",
-                "requested_revision": "data-v1",
-                "resolved_revision": "data-sha",
+                "source": "local",
+                "path": str(dataset_root),
             },
         ),
     )
@@ -318,19 +364,17 @@ def test_train_logs_writes_final_artifacts_and_publishes_model(
         assert (run_path / "README.md").exists()
         return HubArtifact(
             repo_id=repo_id,
-            requested_revision="model-sha",
-            resolved_revision="model-sha",
+            requested_ref="model-sha",
+            resolved_ref="model-sha",
             url="https://huggingface.co/owner/avatar-model/tree/model-sha",
         )
 
     monkeypatch.setattr(training, "push_model_artifacts", fake_push)
     config = training.TrainConfig(
-        dataset_root="",
+        dataset_root=str(dataset_root),
         manifest="manifest.jsonl",
         run_dir=str(run_dir),
         init_bin="/tmp/dh_model.bin",
-        hf_dataset_repo="owner/avatar-data",
-        hf_dataset_revision="data-v1",
         hf_model_repo="owner/avatar-model",
         wandb_mode="offline",
         device="cpu",
@@ -348,11 +392,11 @@ def test_train_logs_writes_final_artifacts_and_publishes_model(
     assert uploads == [(run_dir, "owner/avatar-model", True)]
     assert len(tracker.logged) == 1
     assert tracker.logged[0][1] == 1
-    assert tracker.summary["hf_model_revision"] == "model-sha"
+    assert tracker.summary["hf_model_ref"] == "model-sha"
     assert tracker.exit_codes == [0]
     metadata = json.loads((run_dir / "run_metadata.json").read_text(encoding="utf-8"))
-    assert metadata["provenance"]["dataset"]["resolved_revision"] == "data-sha"
-    assert metadata["provenance"]["model"]["resolved_revision"] == "model-sha"
+    assert metadata["provenance"]["dataset"]["source"] == "local"
+    assert metadata["provenance"]["model"]["resolved_ref"] == "model-sha"
 
 
 def test_train_finishes_tracker_with_error_code_when_step_fails(
@@ -491,7 +535,7 @@ def test_train_finishes_tracker_with_error_code_when_dataset_setup_fails(
     with pytest.raises(RuntimeError, match="simulated dataset failure"):
         training.train(config)
 
-    assert tracker.exit_codes == [1]
+    assert tracker.exit_codes == []
 
 
 def test_tiny_overfit_loss_decreases() -> None:

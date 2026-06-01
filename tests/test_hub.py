@@ -43,23 +43,6 @@ class _FakeApi:
         return _Info("model-sha")
 
 
-def _write_dataset_root(root: Path) -> Path:
-    dataset_root = root / "dataset"
-    clip = dataset_root / "clips" / "clip_001"
-    frames = clip / "frames"
-    frames.mkdir(parents=True)
-    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
-    (dataset_root / "splits.json").write_text("{}\n", encoding="utf-8")
-    (dataset_root / "build_summary.json").write_text("{}\n", encoding="utf-8")
-    (frames / "000001.png").write_bytes(b"png")
-    (clip / "bnf.npy").write_bytes(b"npy")
-    (clip / "bboxes.json").write_text("{}\n", encoding="utf-8")
-    (clip / "quality.json").write_text("{}\n", encoding="utf-8")
-    (clip / "audio.wav").write_bytes(b"excluded")
-    (clip / "video_25fps.mkv").write_bytes(b"excluded")
-    return dataset_root
-
-
 def _write_run_dir(root: Path) -> Path:
     run_dir = root / "run"
     run_dir.mkdir()
@@ -88,83 +71,6 @@ def _write_model_assets_root(root: Path) -> Path:
     return models_root
 
 
-def test_push_dataset_snapshot_uses_large_folder_upload_for_processed_artifacts(
-    tmp_path: Path,
-) -> None:
-    from edge_lipsync.hub import DATASET_UPLOAD_PATTERNS, push_dataset_snapshot
-
-    api = _FakeApi()
-    dataset_root = _write_dataset_root(tmp_path)
-
-    result = push_dataset_snapshot(dataset_root, "owner/avatar-dataset", api=api)
-
-    assert result.resolved_revision == "dataset-sha"
-    assert api.created == [
-        {
-            "repo_id": "owner/avatar-dataset",
-            "repo_type": "dataset",
-            "private": True,
-            "exist_ok": True,
-        }
-    ]
-    assert api.uploads == []
-    assert api.large_uploads[0]["allow_patterns"] == DATASET_UPLOAD_PATTERNS
-    assert api.large_uploads[0]["repo_type"] == "dataset"
-    assert api.large_uploads[0]["folder_path"] == str(dataset_root)
-
-
-def test_push_dataset_snapshot_validates_required_files_before_api_call(tmp_path: Path) -> None:
-    from edge_lipsync.hub import push_dataset_snapshot
-
-    api = _FakeApi()
-
-    with pytest.raises(FileNotFoundError, match="manifest.jsonl"):
-        push_dataset_snapshot(tmp_path, "owner/avatar-dataset", api=api)
-
-    assert api.created == []
-
-
-def test_pull_dataset_snapshot_requires_revision() -> None:
-    from edge_lipsync.hub import pull_dataset_snapshot
-
-    with pytest.raises(ValueError, match="revision"):
-        pull_dataset_snapshot("owner/avatar-dataset", revision="")
-
-
-def test_pull_dataset_snapshot_reports_cached_path_and_resolved_sha(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import edge_lipsync.hub as hub
-
-    cached = tmp_path / "snapshot"
-    cached.mkdir()
-    calls: list[dict[str, Any]] = []
-
-    def fake_snapshot_download(**kwargs: Any) -> str:
-        calls.append(kwargs)
-        return str(cached)
-
-    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
-
-    result = hub.pull_dataset_snapshot(
-        "owner/avatar-dataset",
-        revision="dataset-v1",
-        api=_FakeApi(),
-    )
-
-    assert result.path == cached
-    assert result.requested_revision == "dataset-v1"
-    assert result.resolved_revision == "dataset-sha"
-    assert calls == [
-        {
-            "repo_id": "owner/avatar-dataset",
-            "repo_type": "dataset",
-            "revision": "dataset-v1",
-        }
-    ]
-
-
 def test_push_model_artifacts_uses_model_allowlist(tmp_path: Path) -> None:
     from edge_lipsync.hub import MODEL_UPLOAD_PATTERNS, push_model_artifacts
 
@@ -173,7 +79,7 @@ def test_push_model_artifacts_uses_model_allowlist(tmp_path: Path) -> None:
 
     result = push_model_artifacts(run_dir, "owner/avatar-model", api=api)
 
-    assert result.resolved_revision == "model-commit"
+    assert result.resolved_ref == "model-commit"
     assert api.created == [
         {
             "repo_id": "owner/avatar-model",
@@ -193,7 +99,7 @@ def test_push_model_assets_uploads_assets_allowlist(tmp_path: Path) -> None:
 
     result = push_model_assets(models_root, "owner/edge-lipsync-model-assets", api=api)
 
-    assert result.resolved_revision == "model-commit"
+    assert result.resolved_ref == "model-commit"
     assert api.created == [
         {
             "repo_id": "owner/edge-lipsync-model-assets",
@@ -219,14 +125,7 @@ def test_push_model_assets_validates_required_files_before_api_call(tmp_path: Pa
     assert api.created == []
 
 
-def test_pull_model_checkpoint_requires_revision() -> None:
-    from edge_lipsync.hub import pull_model_checkpoint
-
-    with pytest.raises(ValueError, match="revision"):
-        pull_model_checkpoint("owner/avatar-model", revision="")
-
-
-def test_pull_model_checkpoint_resolves_file_and_revision(
+def test_pull_model_checkpoint_resolves_latest_file_and_ref(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,16 +141,15 @@ def test_pull_model_checkpoint_resolves_file_and_revision(
 
     monkeypatch.setattr(hub, "hf_hub_download", fake_hf_hub_download)
 
-    result = hub.pull_model_checkpoint("owner/avatar-model", revision="model-v1", api=_FakeApi())
+    result = hub.pull_model_checkpoint("owner/avatar-model", api=_FakeApi())
 
     assert result.path == cached
-    assert result.requested_revision == "model-v1"
-    assert result.resolved_revision == "model-sha"
+    assert result.requested_ref == ""
+    assert result.resolved_ref == "model-sha"
     assert calls == [
         {
             "repo_id": "owner/avatar-model",
             "filename": "best.pt",
-            "revision": "model-v1",
         }
     ]
 
@@ -275,19 +173,17 @@ def test_pull_model_assets_downloads_snapshot_to_local_dir(
 
     result = hub.pull_model_assets(
         "owner/edge-lipsync-model-assets",
-        revision="asset-v1",
         local_dir=str(local_dir),
         cache_dir="/cache",
         api=_FakeApi(),
     )
 
     assert result.path == local_dir
-    assert result.requested_revision == "asset-v1"
-    assert result.resolved_revision == "model-sha"
+    assert result.requested_ref == ""
+    assert result.resolved_ref == "model-sha"
     assert calls == [
         {
             "repo_id": "owner/edge-lipsync-model-assets",
-            "revision": "asset-v1",
             "allow_patterns": MODEL_ASSET_UPLOAD_PATTERNS,
             "local_dir": str(local_dir),
             "cache_dir": "/cache",

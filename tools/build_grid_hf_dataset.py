@@ -66,11 +66,6 @@ def main() -> None:
     privacy = parser.add_mutually_exclusive_group()
     privacy.add_argument("--private", action="store_true", help="Create/use a private dataset repo")
     privacy.add_argument("--public", action="store_true", help="Create/use a public dataset repo")
-    parser.add_argument(
-        "--commit-message",
-        default="Upload GRID processed dataset snapshot",
-        help="Commit message for Hugging Face upload",
-    )
     args = parser.parse_args()
 
     if args.push and not args.dry_run and not args.hf_repo_id:
@@ -95,7 +90,6 @@ def main() -> None:
             push=args.push,
             hf_repo_id=args.hf_repo_id,
             private=not args.public,
-            commit_message=args.commit_message,
             strict=args.strict,
         )
     )
@@ -107,8 +101,6 @@ def main() -> None:
     print(f"raw_video_dir={result.raw_video_dir.resolve()}")
     print(f"sample_count={result.sample_count}")
     print(f"raw_video_count={result.raw_video_count}")
-    if result.pushed_revision is not None:
-        print(f"revision={result.pushed_revision}")
     if result.hub_url is not None:
         print(f"url={result.hub_url}")
 

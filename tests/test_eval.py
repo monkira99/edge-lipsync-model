@@ -78,65 +78,69 @@ def test_render_eval_cli_help() -> None:
     assert "--hf-model-repo" in result.stdout
 
 
-def test_resolve_eval_inputs_uses_pinned_hub_sources(
+def test_resolve_eval_inputs_uses_hf_dataset_without_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import edge_lipsync.eval as evaluation
     from edge_lipsync.sources import ResolvedSource
 
-    dataset_root = tmp_path / "dataset"
-    dataset_root.mkdir()
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
     calls: list[tuple[str, dict[str, Any]]] = []
+    loaded_dataset = {"train": [1], "val": [2]}
+    eval_dataset = object()
 
-    def fake_dataset(**kwargs: Any) -> ResolvedSource:
-        calls.append(("dataset", kwargs))
-        return ResolvedSource(path=dataset_root, provenance={"source": "huggingface"})
+    def fake_load_dataset(repo_id: str, *, cache_dir: str = "") -> object:
+        calls.append(("dataset", {"repo_id": repo_id, "cache_dir": cache_dir}))
+        return loaded_dataset
+
+    def fake_hf_dataset(dataset: object, split: str) -> object:
+        calls.append(("hf_dataset", {"dataset": dataset, "split": split}))
+        return eval_dataset
 
     def fake_model(**kwargs: Any) -> ResolvedSource:
         calls.append(("model", kwargs))
         return ResolvedSource(path=checkpoint, provenance={"source": "huggingface"})
 
-    monkeypatch.setattr(evaluation, "resolve_dataset_source", fake_dataset)
+    monkeypatch.setattr(evaluation, "load_processed_dataset", fake_load_dataset)
+    monkeypatch.setattr(evaluation, "DuixHFDataset", fake_hf_dataset)
     monkeypatch.setattr(evaluation, "resolve_model_source", fake_model)
     config = evaluation.RenderEvalConfig(
         dataset_root="",
         ckpt="",
         out_dir=str(tmp_path / "eval"),
         hf_dataset_repo="owner/avatar-data",
-        hf_dataset_revision="data-v1",
         hf_model_repo="owner/avatar-model",
-        hf_model_revision="model-v1",
         hf_model_filename="final.pt",
         hf_cache_dir="/cache",
     )
 
     resolved = evaluation.resolve_eval_inputs(config)
 
-    assert resolved.dataset_root == dataset_root
+    assert resolved.dataset is eval_dataset
     assert resolved.checkpoint == checkpoint
     assert resolved.provenance == {
-        "dataset": {"source": "huggingface"},
+        "dataset": {
+            "source": "huggingface_datasets",
+            "repo_id": "owner/avatar-data",
+        },
         "model": {"source": "huggingface"},
     }
     assert calls == [
         (
             "dataset",
             {
-                "dataset_root": "",
-                "hf_repo": "owner/avatar-data",
-                "hf_revision": "data-v1",
+                "repo_id": "owner/avatar-data",
                 "cache_dir": "/cache",
             },
         ),
+        ("hf_dataset", {"dataset": loaded_dataset, "split": "val"}),
         (
             "model",
             {
                 "checkpoint": "",
                 "hf_repo": "owner/avatar-model",
-                "hf_revision": "model-v1",
                 "hf_filename": "final.pt",
                 "cache_dir": "/cache",
             },

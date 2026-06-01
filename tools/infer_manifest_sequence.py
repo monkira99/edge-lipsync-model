@@ -25,7 +25,6 @@ def main() -> None:
     parser.add_argument("--ckpt", default="")
     parser.add_argument("--init-bin", default="")
     parser.add_argument("--hf-model-repo", default="")
-    parser.add_argument("--hf-model-revision", default="")
     parser.add_argument("--hf-model-filename", default="best.pt")
     parser.add_argument("--hf-cache-dir", default="")
     parser.add_argument("--backend", choices=("torch", "ncnn"), default="torch")
@@ -47,7 +46,6 @@ def main() -> None:
         checkpoint=args.ckpt,
         init_bin=args.init_bin,
         hf_model_repo=args.hf_model_repo,
-        hf_model_revision=args.hf_model_revision,
         hf_model_filename=args.hf_model_filename,
         hf_cache_dir=args.hf_cache_dir,
         backend=args.backend,

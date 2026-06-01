@@ -10,54 +10,65 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from edge_lipsync.dataset import DuixManifestDataset
+from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset
+from edge_lipsync.hf_datasets import load_processed_dataset
 from edge_lipsync.losses import charbonnier_loss, mouth_weighted_l1
 from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
 
 
 @dataclass(frozen=True)
 class RenderEvalConfig:
-    dataset_root: str
-    ckpt: str
     out_dir: str
+    dataset_root: str = ""
+    ckpt: str = ""
     manifest: str = "manifest.jsonl"
     max_batches: int = 32
     device: str = "cpu"
     fps: float = 25.0
     hf_dataset_repo: str = ""
-    hf_dataset_revision: str = ""
     hf_model_repo: str = ""
-    hf_model_revision: str = ""
     hf_model_filename: str = "best.pt"
     hf_cache_dir: str = ""
 
 
 @dataclass(frozen=True)
 class ResolvedEvalInputs:
-    dataset_root: Path
+    dataset: Any
     checkpoint: Path
     provenance: dict[str, Any]
 
 
 def resolve_eval_inputs(config: RenderEvalConfig) -> ResolvedEvalInputs:
-    dataset = resolve_dataset_source(
-        dataset_root=config.dataset_root,
-        hf_repo=config.hf_dataset_repo,
-        hf_revision=config.hf_dataset_revision,
-        cache_dir=config.hf_cache_dir,
-    )
+    if bool(config.dataset_root) == bool(config.hf_dataset_repo):
+        raise ValueError("Set exactly one of dataset_root or hf_dataset_repo")
+    if config.hf_dataset_repo:
+        loaded_dataset = load_processed_dataset(
+            config.hf_dataset_repo,
+            cache_dir=config.hf_cache_dir,
+        )
+        eval_dataset = DuixHFDataset(loaded_dataset, split="val")
+        dataset_provenance = {
+            "source": "huggingface_datasets",
+            "repo_id": config.hf_dataset_repo,
+        }
+    else:
+        dataset_source = resolve_dataset_source(
+            dataset_root=config.dataset_root,
+            cache_dir=config.hf_cache_dir,
+        )
+        eval_dataset = DuixManifestDataset(dataset_source.path, config.manifest, split="val")
+        dataset_provenance = dataset_source.provenance
     model = resolve_model_source(
         checkpoint=config.ckpt,
         hf_repo=config.hf_model_repo,
-        hf_revision=config.hf_model_revision,
         hf_filename=config.hf_model_filename,
         cache_dir=config.hf_cache_dir,
     )
     return ResolvedEvalInputs(
-        dataset_root=dataset.path,
+        dataset=eval_dataset,
         checkpoint=model.path,
         provenance={
-            "dataset": dataset.provenance,
+            "dataset": dataset_provenance,
             "model": model.provenance,
         },
     )
@@ -148,7 +159,7 @@ def write_rgb_video(
 def render_validation_artifacts(
     *,
     model: torch.nn.Module,
-    dataset: DuixManifestDataset,
+    dataset: Any,
     out_dir: str | Path,
     checkpoint_path: str | Path,
     device: torch.device,
@@ -201,8 +212,8 @@ def render_validation_artifacts(
         metadata={
             "kind": "validation_grid_render",
             "checkpoint": str(Path(checkpoint_path).resolve()),
-            "dataset_root": str(dataset.dataset_root.resolve()),
-            "manifest_path": str(dataset.manifest_path.resolve()),
+            "dataset_root": str(getattr(dataset, "dataset_root", "")),
+            "manifest_path": str(getattr(dataset, "manifest_path", "")),
             "metrics": metrics,
             "grid_paths": grid_paths,
         },

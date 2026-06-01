@@ -2,12 +2,10 @@ dataset_root: /absolute/path/to/data/duix_datasets/avatar_name
 manifest: manifest.jsonl
 run_dir: /absolute/path/to/runs/avatar_name
 hf_dataset_repo: ""
-hf_dataset_revision: ""
 hf_cache_dir: ""
 init_bin: /absolute/path/to/dh_model.bin
 init_ckpt: ""
 hf_init_model_repo: ""
-hf_init_model_revision: ""
 hf_init_model_filename: best.pt
 hf_model_repo: ""
 hf_model_private: true

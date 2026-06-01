@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset, require_tool, run
-from edge_lipsync.hub import push_dataset_snapshot
+from edge_lipsync.hf_datasets import push_processed_dataset
 from edge_lipsync.progress import progress
 
 GRID_VIDEO_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg"}
@@ -61,7 +61,6 @@ class GridBuildConfig:
     push: bool = False
     hf_repo_id: str = ""
     private: bool = True
-    commit_message: str = "Upload GRID processed dataset snapshot"
     strict: bool = False
 
 
@@ -74,7 +73,6 @@ class GridBuildResult:
     sample_count: int
     raw_video_count: int
     dry_run: bool
-    pushed_revision: str | None = None
     hub_url: str | None = None
     build_summary: dict[str, Any] | None = None
 
@@ -280,16 +278,13 @@ def build_grid_dataset(config: GridBuildConfig) -> GridBuildResult:
         _dataset_config(config, prepared.raw_video_dir),
         strict=config.strict,
     )
-    pushed_revision: str | None = None
     hub_url: str | None = None
     if config.push:
-        artifact = push_dataset_snapshot(
+        artifact = push_processed_dataset(
             dataset_root,
             config.hf_repo_id,
             private=config.private,
-            commit_message=config.commit_message,
         )
-        pushed_revision = artifact.resolved_revision
         hub_url = artifact.url
     return GridBuildResult(
         grid_root=grid_root,
@@ -299,7 +294,6 @@ def build_grid_dataset(config: GridBuildConfig) -> GridBuildResult:
         sample_count=len(samples),
         raw_video_count=prepared.raw_video_count,
         dry_run=False,
-        pushed_revision=pushed_revision,
         hub_url=hub_url,
         build_summary=build_summary,
     )

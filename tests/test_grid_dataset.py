@@ -70,7 +70,6 @@ def test_build_grid_dataset_dry_run_skips_build_and_push(tmp_path: Path) -> None
     assert result.dry_run is True
     assert result.sample_count == 2
     assert result.raw_video_count == 0
-    assert result.pushed_revision is None
     assert not (tmp_path / "work").exists()
     assert not (tmp_path / "dataset").exists()
 
@@ -173,7 +172,7 @@ def test_build_grid_dataset_invokes_builder_and_pushes_snapshot(
 
     @dataclass(frozen=True)
     class _HubArtifact:
-        resolved_revision: str
+        repo_id: str
         url: str
 
     grid_root = tmp_path / "grid"
@@ -192,27 +191,25 @@ def test_build_grid_dataset_invokes_builder_and_pushes_snapshot(
         _write_dataset_artifacts(Path(config.dataset_root))
         return {"processed": 1}
 
-    def fake_push_dataset_snapshot(
+    def fake_push_processed_dataset(
         dataset_root_arg: str | Path,
         repo_id: str,
         *,
         private: bool,
-        commit_message: str,
     ) -> _HubArtifact:
         push_calls.append(
             {
                 "dataset_root": Path(dataset_root_arg),
                 "repo_id": repo_id,
                 "private": private,
-                "commit_message": commit_message,
             }
         )
-        return _HubArtifact("abc123", "https://huggingface.co/datasets/owner/grid-duix/tree/abc123")
+        return _HubArtifact("owner/grid-duix", "https://huggingface.co/datasets/owner/grid-duix")
 
     monkeypatch.setattr(grid_dataset, "require_tool", lambda name: name)
     monkeypatch.setattr(grid_dataset, "run", fake_run)
     monkeypatch.setattr(grid_dataset, "build_dataset", fake_build_dataset)
-    monkeypatch.setattr(grid_dataset, "push_dataset_snapshot", fake_push_dataset_snapshot)
+    monkeypatch.setattr(grid_dataset, "push_processed_dataset", fake_push_processed_dataset)
 
     result = grid_dataset.build_grid_dataset(
         grid_dataset.GridBuildConfig(
@@ -232,8 +229,7 @@ def test_build_grid_dataset_invokes_builder_and_pushes_snapshot(
 
     assert result.sample_count == 1
     assert result.raw_video_count == 1
-    assert result.pushed_revision == "abc123"
-    assert result.hub_url == "https://huggingface.co/datasets/owner/grid-duix/tree/abc123"
+    assert result.hub_url == "https://huggingface.co/datasets/owner/grid-duix"
     assert Path(build_calls[0][0].raw_video_dir) == work_dir / "raw_videos"
     assert Path(build_calls[0][0].dataset_root) == dataset_root
     assert build_calls[0][0].wenet_onnx == "models/wenet.onnx"
@@ -244,7 +240,6 @@ def test_build_grid_dataset_invokes_builder_and_pushes_snapshot(
             "dataset_root": dataset_root,
             "repo_id": "owner/grid-duix",
             "private": False,
-            "commit_message": "Upload GRID processed dataset snapshot",
         }
     ]
 

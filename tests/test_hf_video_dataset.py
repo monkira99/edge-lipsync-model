@@ -10,7 +10,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class _HubArtifact:
-    resolved_revision: str
+    repo_id: str
     url: str
 
 
@@ -134,7 +134,6 @@ def test_build_hf_video_dataset_dry_run_filters_by_speaker(
     result = hf_video_dataset.build_hf_video_dataset(
         hf_video_dataset.HfVideoDatasetBuildConfig(
             repo_id="Pinch-Research/lipsync-hdtf-training-data",
-            revision="dataset-sha",
             dataset_root=str(tmp_path / "dataset"),
             work_dir=str(tmp_path / "work"),
             wenet_onnx="models/wenet/wenet.onnx",
@@ -180,7 +179,6 @@ def test_build_hf_video_dataset_list_speakers_skips_push_requirement(
     result = hf_video_dataset.build_hf_video_dataset(
         hf_video_dataset.HfVideoDatasetBuildConfig(
             repo_id="Pinch-Research/lipsync-hdtf-training-data",
-            revision="dataset-sha",
             dataset_root=str(tmp_path / "dataset"),
             work_dir=str(tmp_path / "work"),
             wenet_onnx="models/wenet/wenet.onnx",
@@ -210,7 +208,6 @@ def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: 
     result = build_hf_video_dataset(
         HfVideoDatasetBuildConfig(
             repo_id="Pinch-Research/lipsync-hdtf-training-data",
-            revision="dataset-sha",
             dataset_root=str(tmp_path / "dataset"),
             work_dir=str(tmp_path / "work"),
             wenet_onnx="models/wenet/wenet.onnx",
@@ -226,13 +223,11 @@ def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: 
     assert result.dry_run is True
     assert result.selected_video_count == 1
     assert result.raw_video_count == 0
-    assert result.pushed_revision is None
     assert not hasattr(result, "snapshot_path")
     assert api.calls == [
         {
             "repo_id": "Pinch-Research/lipsync-hdtf-training-data",
             "repo_type": "dataset",
-            "revision": "dataset-sha",
         }
     ]
     assert not (tmp_path / "work").exists()
@@ -260,7 +255,6 @@ def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
 
     def fake_download_hf_video_files(
         repo_id: str,
-        revision: str,
         video_files: list[str],
         raw_video_dir: str | Path,
         *,
@@ -271,7 +265,6 @@ def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
         download_calls.append(
             {
                 "repo_id": repo_id,
-                "revision": revision,
                 "video_files": video_files,
                 "raw_video_dir": Path(raw_video_dir),
                 "cache_dir": cache_dir,
@@ -292,31 +285,28 @@ def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
         _write_dataset_artifacts(Path(config.dataset_root))
         return {"processed_clips": 2}
 
-    def fake_push_dataset_snapshot(
+    def fake_push_processed_dataset(
         dataset_root: str | Path,
         repo_id: str,
         *,
         private: bool,
-        commit_message: str,
     ) -> _HubArtifact:
         push_calls.append(
             {
                 "dataset_root": Path(dataset_root),
                 "repo_id": repo_id,
                 "private": private,
-                "commit_message": commit_message,
             }
         )
-        return _HubArtifact("processed-sha", "https://huggingface.co/datasets/owner/hdtf-duix")
+        return _HubArtifact("owner/hdtf-duix", "https://huggingface.co/datasets/owner/hdtf-duix")
 
     monkeypatch.setattr(hf_video_dataset, "download_hf_video_files", fake_download_hf_video_files)
     monkeypatch.setattr(hf_video_dataset, "build_dataset", fake_build_dataset)
-    monkeypatch.setattr(hf_video_dataset, "push_dataset_snapshot", fake_push_dataset_snapshot)
+    monkeypatch.setattr(hf_video_dataset, "push_processed_dataset", fake_push_processed_dataset)
 
     result = hf_video_dataset.build_hf_video_dataset(
         hf_video_dataset.HfVideoDatasetBuildConfig(
             repo_id="Pinch-Research/lipsync-hdtf-training-data",
-            revision="dataset-sha",
             dataset_root=str(tmp_path / "dataset"),
             work_dir=str(tmp_path / "work"),
             wenet_onnx="models/wenet/wenet.onnx",
@@ -333,11 +323,10 @@ def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
     assert result.dry_run is False
     assert result.selected_video_count == 2
     assert result.raw_video_count == 2
-    assert result.pushed_revision == "processed-sha"
+    assert result.hub_url == "https://huggingface.co/datasets/owner/hdtf-duix"
     assert download_calls == [
         {
             "repo_id": "Pinch-Research/lipsync-hdtf-training-data",
-            "revision": "dataset-sha",
             "video_files": [
                 "xdub_teacher_pairs/videos/a.mp4",
                 "xdub_teacher_pairs/videos/b.mp4",
@@ -359,7 +348,6 @@ def test_build_hf_video_dataset_loads_subset_builds_and_pushes(
             "dataset_root": tmp_path / "dataset",
             "repo_id": "owner/hdtf-duix",
             "private": False,
-            "commit_message": "Upload processed HF video dataset snapshot",
         }
     ]
 
@@ -400,7 +388,6 @@ def test_download_hf_video_files_uses_datasets_loader_and_links_local_paths(
 
     paths = hf_video_dataset.download_hf_video_files(
         "owner/source-dataset",
-        "dataset-sha",
         ["videos/a.mp4", "videos/b.mp4"],
         tmp_path / "raw",
         cache_dir=str(cached),
@@ -414,7 +401,7 @@ def test_download_hf_video_files_uses_datasets_loader_and_links_local_paths(
     assert args == ("owner/source-dataset",)
     assert kwargs["data_files"] == {"train": ["videos/a.mp4", "videos/b.mp4"]}
     assert kwargs["split"] == "train"
-    assert kwargs["revision"] == "dataset-sha"
+    assert "revision" not in kwargs
     assert kwargs["cache_dir"] == str(cached)
     assert kwargs["drop_labels"] is True
     assert kwargs["drop_metadata"] is True
@@ -432,27 +419,6 @@ def test_download_hf_video_files_uses_datasets_loader_and_links_local_paths(
             "unit": "clip",
         }
     ]
-
-
-def test_build_hf_video_dataset_requires_pinned_revision(tmp_path: Path) -> None:
-    from edge_lipsync.hf_video_dataset import HfVideoDatasetBuildConfig, build_hf_video_dataset
-
-    api = _FakeApi([])
-
-    try:
-        build_hf_video_dataset(
-            HfVideoDatasetBuildConfig(
-                repo_id="Pinch-Research/lipsync-hdtf-training-data",
-                revision="",
-                dataset_root=str(tmp_path / "dataset"),
-                wenet_onnx="models/wenet/wenet.onnx",
-            ),
-            api=api,
-        )
-    except ValueError as exc:
-        assert "revision" in str(exc)
-    else:
-        raise AssertionError("expected pinned revision error")
 
 
 def test_download_hf_video_files_restores_worker_limit_after_loader_error(
@@ -475,7 +441,6 @@ def test_download_hf_video_files_restores_worker_limit_after_loader_error(
     try:
         hf_video_dataset.download_hf_video_files(
             "owner/source-dataset",
-            "dataset-sha",
             ["videos/a.mp4"],
             tmp_path / "raw",
         )
@@ -496,7 +461,6 @@ def test_build_hf_video_dataset_rejects_non_positive_download_workers(tmp_path: 
         build_hf_video_dataset(
             HfVideoDatasetBuildConfig(
                 repo_id="Pinch-Research/lipsync-hdtf-training-data",
-                revision="dataset-sha",
                 dataset_root=str(tmp_path / "dataset"),
                 wenet_onnx="models/wenet/wenet.onnx",
                 download_max_workers=0,
@@ -519,6 +483,7 @@ def test_build_hf_video_dataset_cli_help() -> None:
 
     assert "Build a Duix dataset from videos stored in a Hugging Face dataset" in result.stdout
     assert "--repo-id" in result.stdout
+    assert "--revision" not in result.stdout
     assert "--video-prefix" in result.stdout
     assert "--max-videos" in result.stdout
     assert "--download-max-workers" in result.stdout
@@ -542,13 +507,11 @@ def test_build_hf_video_dataset_cli_passes_download_max_workers(
         return SimpleNamespace(
             dry_run=True,
             repo_id=config.repo_id,
-            requested_revision=config.revision,
             dataset_root=Path(config.dataset_root),
             work_dir=tmp_path / "work",
             raw_video_dir=tmp_path / "work" / "raw_videos",
             selected_video_count=1,
             raw_video_count=0,
-            pushed_revision=None,
             hub_url=None,
         )
 
@@ -560,8 +523,6 @@ def test_build_hf_video_dataset_cli_passes_download_max_workers(
             "build_hf_video_dataset.py",
             "--repo-id",
             "Pinch-Research/lipsync-hdtf-training-data",
-            "--revision",
-            "dataset-sha",
             "--dataset-root",
             str(tmp_path / "dataset"),
             "--wenet-onnx",

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from edge_lipsync.hub import pull_dataset_snapshot, pull_model_checkpoint
+from edge_lipsync.hub import pull_model_checkpoint
 
 
 @dataclass(frozen=True)
@@ -38,33 +38,22 @@ def resolve_dataset_source(
     *,
     dataset_root: str,
     hf_repo: str = "",
-    hf_revision: str = "",
     cache_dir: str = "",
 ) -> ResolvedSource:
-    _require_exactly_one_source(dataset_root, hf_repo)
+    del cache_dir
+    if hf_repo:
+        raise ValueError("Hugging Face datasets are loaded with datasets.load_dataset")
+    if not dataset_root:
+        raise ValueError("dataset_root is required for local dataset sources")
     if dataset_root:
         return _local_source(dataset_root, kind="dataset")
-    artifact = pull_dataset_snapshot(hf_repo, revision=hf_revision, cache_dir=cache_dir)
-    if artifact.path is None:
-        raise ValueError("Downloaded Hugging Face dataset snapshot had no local path")
-    return ResolvedSource(
-        path=artifact.path,
-        provenance={
-            "source": "huggingface",
-            "repo_id": artifact.repo_id,
-            "requested_revision": artifact.requested_revision,
-            "resolved_revision": artifact.resolved_revision,
-            "url": artifact.url,
-            "path": str(artifact.path),
-        },
-    )
+    raise AssertionError("unreachable")
 
 
 def resolve_model_source(
     *,
     checkpoint: str,
     hf_repo: str = "",
-    hf_revision: str = "",
     hf_filename: str = "best.pt",
     cache_dir: str = "",
 ) -> ResolvedSource:
@@ -73,7 +62,6 @@ def resolve_model_source(
         return _local_source(checkpoint, kind="model")
     artifact = pull_model_checkpoint(
         hf_repo,
-        revision=hf_revision,
         filename=hf_filename,
         cache_dir=cache_dir,
     )
@@ -84,8 +72,8 @@ def resolve_model_source(
         provenance={
             "source": "huggingface",
             "repo_id": artifact.repo_id,
-            "requested_revision": artifact.requested_revision,
-            "resolved_revision": artifact.resolved_revision,
+            "requested_ref": artifact.requested_ref,
+            "resolved_ref": artifact.resolved_ref,
             "filename": hf_filename,
             "url": artifact.url,
             "path": str(artifact.path),
