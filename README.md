@@ -17,12 +17,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
-For landmark-based dataset building, install MediaPipe in the same environment:
-
-```bash
-.venv/bin/python -m pip install mediapipe
-```
-
+Landmark-based dataset building uses MediaPipe, which is installed as a project dependency.
 Current MediaPipe Tasks also needs a FaceLandmarker model asset. Download
 `face_landmarker.task` from Google's model bucket and set `landmark_model_asset_path` in the
 dataset config:
