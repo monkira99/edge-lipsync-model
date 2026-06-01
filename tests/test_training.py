@@ -399,6 +399,68 @@ def test_train_logs_writes_final_artifacts_and_publishes_model(
     assert metadata["provenance"]["model"]["resolved_ref"] == "model-sha"
 
 
+def test_train_prints_progress_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(tmp_path / "run"),
+        init_bin="/tmp/dh_model.bin",
+        device="cpu",
+        max_steps=1,
+        warmup_steps=0,
+        stabilization_steps=0,
+        validation_interval=1,
+        checkpoint_interval=1,
+        log_interval=1,
+    )
+
+    training.train(config)
+
+    out = capsys.readouterr().out
+    assert "[train] step=1/1" in out
+    assert "train_loss=" in out
+    assert "val_reconstruction_loss=" in out
+
+
 def test_train_finishes_tracker_with_error_code_when_step_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

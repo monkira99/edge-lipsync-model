@@ -43,6 +43,7 @@ class TrainConfig:
     stabilization_lr_scale: float = 0.1
     validation_interval: int = 100
     checkpoint_interval: int = 100
+    log_interval: int = 10
     hf_dataset_repo: str = ""
     hf_cache_dir: str = ""
     hf_init_model_repo: str = ""
@@ -243,6 +244,38 @@ def _write_metrics(metrics: list[dict[str, float | int | str]], run_dir: Path) -
         writer.writerows(metrics)
 
 
+def _format_training_log(row: dict[str, float | int | str], *, max_steps: int) -> str:
+    parts = [
+        "[train]",
+        f"step={row['step']}/{max_steps}",
+        f"epoch={row['epoch']}",
+        f"phase={row['phase']}",
+        f"lr={float(row['learning_rate']):.3g}",
+        f"train_loss={float(row['train_loss']):.6g}",
+    ]
+    for key in ("val_reconstruction_loss", "val_mouth_loss", "val_temporal_delta"):
+        if key in row:
+            parts.append(f"{key}={float(row[key]):.6g}")
+    return " ".join(parts)
+
+
+def _should_log_step(
+    row: dict[str, float | int | str],
+    *,
+    max_steps: int,
+    log_interval: int,
+) -> bool:
+    if log_interval <= 0:
+        return False
+    step = int(row["step"])
+    return (
+        step == 1
+        or step == max_steps
+        or step % log_interval == 0
+        or "val_reconstruction_loss" in row
+    )
+
+
 def write_run_metadata(
     run_dir: str | Path,
     *,
@@ -401,6 +434,8 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("max_steps must be positive")
     if config.validation_interval <= 0 or config.checkpoint_interval <= 0:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
+    if config.log_interval < 0:
+        raise ValueError("log_interval must be >= 0")
     run_dir = Path(config.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     prepared_data = prepare_training_datasets(config, run_dir=run_dir)
@@ -525,6 +560,12 @@ def train(config: TrainConfig) -> Path:
                     )
                 metrics.append(row)
                 tracker.log_metrics(row, step=step)
+                if _should_log_step(
+                    row,
+                    max_steps=config.max_steps,
+                    log_interval=config.log_interval,
+                ):
+                    print(_format_training_log(row, max_steps=config.max_steps), flush=True)
                 if step >= config.max_steps:
                     break
 

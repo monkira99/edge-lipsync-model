@@ -231,6 +231,8 @@ Load a processed dataset through Hugging Face `datasets`:
 Training writes atomic checkpoints, `best.pt`, `final.pt`, `metrics.json`, `metrics.csv`,
 `run_metadata.json`, and a model card. Checkpoints include the dataset manifest hash, training
 config, step, epoch, metrics, initialization source, dataset provenance, and W&B run provenance.
+The train loop also prints concise progress rows to stdout every `log_interval` steps and whenever
+validation runs, which is useful in Colab notebooks.
 
 The example config uses local paths. To train from a Hugging Face dataset, set:
 
