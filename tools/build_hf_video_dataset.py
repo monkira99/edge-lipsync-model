@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from edge_lipsync.hf_video_dataset import (  # noqa: E402
+    DEFAULT_METADATA_MANIFEST,
     DEFAULT_VIDEO_PREFIX,
     HfVideoDatasetBuildConfig,
     build_hf_video_dataset,
@@ -31,6 +32,18 @@ def main() -> None:
         help="Maximum concurrent datasets file downloads. Keep at 1 to avoid rate limits.",
     )
     parser.add_argument("--video-prefix", default=DEFAULT_VIDEO_PREFIX)
+    parser.add_argument("--metadata-manifest", default=DEFAULT_METADATA_MANIFEST)
+    parser.add_argument("--metadata-prefix", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--speaker-id",
+        default="",
+        help="Only build clips whose metadata src_speaker and alt_speaker match this speaker id.",
+    )
+    parser.add_argument(
+        "--list-speakers",
+        action="store_true",
+        help="List speaker ids and available clip counts without downloading or building.",
+    )
     parser.add_argument(
         "--max-videos",
         type=int,
@@ -78,7 +91,7 @@ def main() -> None:
         help="Commit message for processed dataset upload",
     )
     args = parser.parse_args()
-    if args.push and not args.dry_run and not args.hf_output_repo_id:
+    if args.push and not args.dry_run and not args.list_speakers and not args.hf_output_repo_id:
         parser.error("--hf-output-repo-id is required when --push is set")
 
     result = build_hf_video_dataset(
@@ -90,6 +103,9 @@ def main() -> None:
             cache_dir=args.cache_dir,
             download_max_workers=args.download_max_workers,
             video_prefix=args.video_prefix,
+            metadata_manifest=args.metadata_manifest,
+            speaker_id=args.speaker_id,
+            list_speakers=args.list_speakers,
             max_videos=args.max_videos,
             wenet_onnx=args.wenet_onnx,
             landmark_model_asset_path=args.landmark_model_asset_path,
@@ -116,6 +132,18 @@ def main() -> None:
     print(f"raw_video_dir={result.raw_video_dir.resolve()}")
     print(f"selected_video_count={result.selected_video_count}")
     print(f"raw_video_count={result.raw_video_count}")
+    if getattr(result, "speaker_id", ""):
+        print(f"speaker_id={result.speaker_id}")
+    speaker_counts = getattr(result, "speaker_counts", None) or {}
+    if speaker_counts:
+        print(f"speaker_count={len(speaker_counts)}")
+    if args.list_speakers:
+        speaker_rows = sorted(
+            speaker_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        for speaker_id, count in speaker_rows:
+            print(f"{speaker_id}\t{count}")
     if result.pushed_revision is not None:
         print(f"processed_revision={result.pushed_revision}")
     if result.hub_url is not None:

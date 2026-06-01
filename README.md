@@ -113,6 +113,9 @@ decoding stays disabled while the adapter links the cached local MP4 paths into 
 The datasets downloader is limited to one worker by default; adjust `--download-max-workers` only
 when the Hub endpoint can handle additional concurrency. Authenticate with `HF_TOKEN` before large
 downloads so the Hub does not apply the lower anonymous resolver quota.
+For one-person training, list speakers first and then build with `--speaker-id`; the filter uses
+`src_speaker == alt_speaker == speaker_id` from `xdub_teacher_pairs_manifest.json` before any video
+download starts.
 
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \
@@ -126,6 +129,36 @@ downloads so the Hub does not apply the lower anonymous resolver quota.
   --download-max-workers 1 \
   --max-videos 20 \
   --dry-run
+```
+
+List available speakers and clip counts:
+
+```bash
+.venv/bin/python tools/build_hf_video_dataset.py \
+  --repo-id Pinch-Research/lipsync-hdtf-training-data \
+  --revision pinned_dataset_commit_sha \
+  --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
+  --work-dir /absolute/path/to/work/hdtf_xdub \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --video-prefix xdub_teacher_pairs/videos \
+  --list-speakers
+```
+
+Build all available clips for one speaker by setting `--max-videos 0`:
+
+```bash
+.venv/bin/python tools/build_hf_video_dataset.py \
+  --repo-id Pinch-Research/lipsync-hdtf-training-data \
+  --revision pinned_dataset_commit_sha \
+  --dataset-root /absolute/path/to/data/hdtf_xdub_duix_dataset \
+  --work-dir /absolute/path/to/work/hdtf_xdub \
+  --wenet-onnx /absolute/path/to/models/wenet.onnx \
+  --landmark-model-asset-path /absolute/path/to/models/face_landmarker.task \
+  --video-prefix xdub_teacher_pairs/videos \
+  --speaker-id AdamSchiff \
+  --download-max-workers 1 \
+  --max-videos 0
 ```
 
 When the selected subset looks correct, remove `--dry-run`. Add `--push` to publish the processed

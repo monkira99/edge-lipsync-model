@@ -63,6 +63,137 @@ def test_select_hf_video_dataset_files_limits_videos_without_snapshot_patterns()
     assert not hasattr(selection, "allow_patterns")
 
 
+def test_select_hf_video_dataset_files_filters_by_speaker_metadata() -> None:
+    from edge_lipsync.hf_video_dataset import select_hf_video_dataset_files
+
+    selection = select_hf_video_dataset_files(
+        [
+            "xdub_teacher_pairs/videos/Alice_shot_001__x__Alice_shot_002.mp4",
+            "xdub_teacher_pairs/videos/Alice_shot_003__x__Alice_shot_004.mp4",
+            "xdub_teacher_pairs/videos/Bob_shot_001__x__Bob_shot_002.mp4",
+            "xdub_teacher_pairs/videos/NotInManifest.mp4",
+        ],
+        video_prefix="xdub_teacher_pairs/videos",
+        max_videos=1,
+        speaker_id="Alice",
+        metadata_entries=[
+            {
+                "id": "Alice_shot_001__x__Alice_shot_002",
+                "src_speaker": "Alice",
+                "alt_speaker": "Alice",
+            },
+            {
+                "id": "Alice_shot_003__x__Alice_shot_004",
+                "src_speaker": "Alice",
+                "alt_speaker": "Alice",
+            },
+            {
+                "id": "Bob_shot_001__x__Bob_shot_002",
+                "src_speaker": "Bob",
+                "alt_speaker": "Bob",
+            },
+        ],
+    )
+
+    assert selection.video_files == [
+        "xdub_teacher_pairs/videos/Alice_shot_001__x__Alice_shot_002.mp4"
+    ]
+    assert selection.speaker_counts == {"Alice": 2, "Bob": 1}
+
+
+def test_build_hf_video_dataset_dry_run_filters_by_speaker(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import edge_lipsync.hf_video_dataset as hf_video_dataset
+
+    api = _FakeApi(
+        [
+            "xdub_teacher_pairs_manifest.json",
+            "xdub_teacher_pairs/videos/Alice_shot_001__x__Alice_shot_002.mp4",
+            "xdub_teacher_pairs/videos/Bob_shot_001__x__Bob_shot_002.mp4",
+        ]
+    )
+    monkeypatch.setattr(
+        hf_video_dataset,
+        "load_hf_video_metadata_manifest",
+        lambda **_kwargs: [
+            {
+                "id": "Alice_shot_001__x__Alice_shot_002",
+                "src_speaker": "Alice",
+                "alt_speaker": "Alice",
+            },
+            {
+                "id": "Bob_shot_001__x__Bob_shot_002",
+                "src_speaker": "Bob",
+                "alt_speaker": "Bob",
+            },
+        ],
+    )
+
+    result = hf_video_dataset.build_hf_video_dataset(
+        hf_video_dataset.HfVideoDatasetBuildConfig(
+            repo_id="Pinch-Research/lipsync-hdtf-training-data",
+            revision="dataset-sha",
+            dataset_root=str(tmp_path / "dataset"),
+            work_dir=str(tmp_path / "work"),
+            wenet_onnx="models/wenet/wenet.onnx",
+            speaker_id="Alice",
+            dry_run=True,
+        ),
+        api=api,
+    )
+
+    assert result.dry_run is True
+    assert result.speaker_id == "Alice"
+    assert result.speaker_counts == {"Alice": 1, "Bob": 1}
+    assert result.selected_video_count == 1
+    assert result.selected_video_files == [
+        "xdub_teacher_pairs/videos/Alice_shot_001__x__Alice_shot_002.mp4"
+    ]
+
+
+def test_build_hf_video_dataset_list_speakers_skips_push_requirement(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    import edge_lipsync.hf_video_dataset as hf_video_dataset
+
+    api = _FakeApi(
+        [
+            "xdub_teacher_pairs_manifest.json",
+            "xdub_teacher_pairs/videos/Alice_shot_001__x__Alice_shot_002.mp4",
+        ]
+    )
+    monkeypatch.setattr(
+        hf_video_dataset,
+        "load_hf_video_metadata_manifest",
+        lambda **_kwargs: [
+            {
+                "id": "Alice_shot_001__x__Alice_shot_002",
+                "src_speaker": "Alice",
+                "alt_speaker": "Alice",
+            }
+        ],
+    )
+
+    result = hf_video_dataset.build_hf_video_dataset(
+        hf_video_dataset.HfVideoDatasetBuildConfig(
+            repo_id="Pinch-Research/lipsync-hdtf-training-data",
+            revision="dataset-sha",
+            dataset_root=str(tmp_path / "dataset"),
+            work_dir=str(tmp_path / "work"),
+            wenet_onnx="models/wenet/wenet.onnx",
+            list_speakers=True,
+            push=True,
+        ),
+        api=api,
+    )
+
+    assert result.dry_run is True
+    assert result.speaker_counts == {"Alice": 1}
+
+
 def test_build_hf_video_dataset_dry_run_skips_download_build_and_push(tmp_path: Path) -> None:
     from edge_lipsync.hf_video_dataset import HfVideoDatasetBuildConfig, build_hf_video_dataset
 
@@ -392,6 +523,8 @@ def test_build_hf_video_dataset_cli_help() -> None:
     assert "--max-videos" in result.stdout
     assert "--download-max-workers" in result.stdout
     assert "--download-request-interval-seconds" not in result.stdout
+    assert "--speaker-id" in result.stdout
+    assert "--list-speakers" in result.stdout
     assert "--dry-run" in result.stdout
     assert "--no-progress" in result.stdout
 

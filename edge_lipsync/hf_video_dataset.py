@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,16 +21,18 @@ from datasets import (
 )
 
 from edge_lipsync.build_dataset import DatasetBuildConfig, build_dataset
-from edge_lipsync.hub import HfApi, push_dataset_snapshot
+from edge_lipsync.hub import HfApi, hf_hub_download, push_dataset_snapshot
 from edge_lipsync.progress import progress
 
 DEFAULT_VIDEO_PREFIX = "xdub_teacher_pairs/videos"
+DEFAULT_METADATA_MANIFEST = "xdub_teacher_pairs_manifest.json"
 VIDEO_SUFFIXES = (".mp4", ".mov", ".mkv", ".avi", ".mpeg", ".mpg")
 
 
 @dataclass(frozen=True)
 class HfVideoFileSelection:
     video_files: list[str]
+    speaker_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,9 @@ class HfVideoDatasetBuildConfig:
     dataset_root: str
     wenet_onnx: str
     video_prefix: str = DEFAULT_VIDEO_PREFIX
+    metadata_manifest: str = DEFAULT_METADATA_MANIFEST
+    speaker_id: str = ""
+    list_speakers: bool = False
     work_dir: str = ""
     cache_dir: str = ""
     download_max_workers: int = 1
@@ -79,6 +86,8 @@ class HfVideoDatasetBuildResult:
     raw_video_count: int
     dry_run: bool
     selected_video_files: list[str]
+    speaker_id: str = ""
+    speaker_counts: dict[str, int] | None = None
     pushed_revision: str | None = None
     hub_url: str | None = None
     build_summary: dict[str, Any] | None = None
@@ -101,23 +110,88 @@ def _normalized_prefix(prefix: str) -> str:
     return prefix.strip("/")
 
 
+def _speaker_for_metadata_entry(entry: dict[str, Any]) -> str:
+    src_speaker = str(entry.get("src_speaker") or "").strip()
+    alt_speaker = str(entry.get("alt_speaker") or "").strip()
+    if not src_speaker:
+        return ""
+    if alt_speaker and alt_speaker != src_speaker:
+        return ""
+    return src_speaker
+
+
+def _video_path_for_metadata_entry(entry: dict[str, Any], video_root: str) -> str:
+    video_id = str(entry.get("id") or "").strip()
+    if not video_id:
+        return ""
+    return f"{video_root}/{video_id}.mp4"
+
+
+def load_hf_video_metadata_manifest(
+    *,
+    repo_id: str,
+    revision: str,
+    metadata_manifest: str = DEFAULT_METADATA_MANIFEST,
+    cache_dir: str = "",
+) -> list[dict[str, Any]]:
+    path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=revision,
+        filename=metadata_manifest,
+        cache_dir=cache_dir or None,
+    )
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Expected {metadata_manifest} to contain a JSON list")
+    entries = [entry for entry in payload if isinstance(entry, dict)]
+    if len(entries) != len(payload):
+        raise ValueError(f"Expected every {metadata_manifest} row to be a JSON object")
+    return entries
+
+
 def select_hf_video_dataset_files(
     repo_files: list[str],
     *,
     video_prefix: str = DEFAULT_VIDEO_PREFIX,
     max_videos: int = 0,
+    speaker_id: str = "",
+    metadata_entries: list[dict[str, Any]] | None = None,
 ) -> HfVideoFileSelection:
     if max_videos < 0:
         raise ValueError("max_videos must be >= 0")
     video_root = _normalized_prefix(video_prefix)
+    speaker_id = speaker_id.strip()
     video_files = sorted(
         file_path
         for file_path in repo_files
         if file_path.startswith(f"{video_root}/") and file_path.lower().endswith(VIDEO_SUFFIXES)
     )
+    speaker_counts: dict[str, int] = {}
+    if metadata_entries is not None:
+        repo_file_set = set(video_files)
+        speaker_video_pairs: list[tuple[str, str]] = []
+        counts: Counter[str] = Counter()
+        for entry in metadata_entries:
+            speaker = _speaker_for_metadata_entry(entry)
+            video_file = _video_path_for_metadata_entry(entry, video_root)
+            if not speaker or video_file not in repo_file_set:
+                continue
+            counts[speaker] += 1
+            speaker_video_pairs.append((video_file, speaker))
+        speaker_counts = dict(sorted(counts.items()))
+        if speaker_id:
+            video_files = sorted(
+                video_file
+                for video_file, speaker in speaker_video_pairs
+                if speaker == speaker_id
+            )
+    elif speaker_id:
+        raise ValueError("metadata_entries are required when speaker_id is set")
+
     if max_videos:
         video_files = video_files[:max_videos]
-    return HfVideoFileSelection(video_files=video_files)
+    return HfVideoFileSelection(video_files=video_files, speaker_counts=speaker_counts)
 
 
 def _default_work_dir(dataset_root: Path) -> Path:
@@ -237,7 +311,12 @@ def build_hf_video_dataset(
     _require_revision(config.revision)
     if config.download_max_workers < 1:
         raise ValueError("download_max_workers must be >= 1")
-    if config.push and not config.dry_run and not config.hf_output_repo_id:
+    if (
+        config.push
+        and not config.dry_run
+        and not config.list_speakers
+        and not config.hf_output_repo_id
+    ):
         raise ValueError("hf_output_repo_id is required when push=True")
     dataset_root = Path(config.dataset_root)
     work_dir = Path(config.work_dir) if config.work_dir else _default_work_dir(dataset_root)
@@ -248,17 +327,28 @@ def build_hf_video_dataset(
         repo_type="dataset",
         revision=config.revision,
     )
+    metadata_entries = None
+    if config.speaker_id or config.list_speakers:
+        metadata_entries = load_hf_video_metadata_manifest(
+            repo_id=config.repo_id,
+            revision=config.revision,
+            metadata_manifest=config.metadata_manifest,
+            cache_dir=config.cache_dir,
+        )
     selection = select_hf_video_dataset_files(
         list(repo_files),
         video_prefix=config.video_prefix,
         max_videos=config.max_videos,
+        speaker_id=config.speaker_id,
+        metadata_entries=metadata_entries,
     )
     if not selection.video_files:
+        speaker_note = f" for speaker_id={config.speaker_id!r}" if config.speaker_id else ""
         raise ValueError(
             f"No video files found in {config.repo_id}@{config.revision} "
-            f"under {config.video_prefix!r}"
+            f"under {config.video_prefix!r}{speaker_note}"
         )
-    if config.dry_run:
+    if config.dry_run or config.list_speakers:
         return HfVideoDatasetBuildResult(
             repo_id=config.repo_id,
             requested_revision=config.revision,
@@ -269,6 +359,8 @@ def build_hf_video_dataset(
             raw_video_count=0,
             dry_run=True,
             selected_video_files=selection.video_files,
+            speaker_id=config.speaker_id,
+            speaker_counts=selection.speaker_counts,
         )
 
     raw_video_paths = download_hf_video_files(
@@ -306,6 +398,8 @@ def build_hf_video_dataset(
         raw_video_count=len(raw_video_paths),
         dry_run=False,
         selected_video_files=selection.video_files,
+        speaker_id=config.speaker_id,
+        speaker_counts=selection.speaker_counts,
         pushed_revision=pushed_revision,
         hub_url=hub_url,
         build_summary=build_summary,
