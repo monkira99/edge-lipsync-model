@@ -25,8 +25,9 @@ log_interval: 10
 media_eval_on_best: true
 media_eval_clip_count: 2
 media_eval_clip_ids: []
-media_eval_max_frames_per_clip: 250
+media_eval_max_frames_per_clip: 50
 media_eval_fps: 25.0
+media_eval_log_to_wandb: false
 wandb_mode: disabled
 wandb_project: edge-lipsync-model
 wandb_entity: ""

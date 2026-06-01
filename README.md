@@ -236,9 +236,10 @@ validation runs, which is useful in Colab notebooks.
 
 When `media_eval_on_best` is enabled, every new `best.pt` renders a validation grid MP4 from the
 first `media_eval_clip_count` unique clips in the validation split. The selected clip IDs and frame
-indices are recorded in run provenance, local videos are written under `media_eval/`, and W&B logs
-the MP4 when tracking is enabled. Set `media_eval_clip_ids` to pin exact validation clips instead of
-using the first clips.
+indices are recorded in run provenance, and local videos are written under `media_eval/`. W&B video
+upload is disabled by default to keep Colab training from blocking on large MP4 uploads; set
+`media_eval_log_to_wandb: true` only when you explicitly want best-checkpoint videos in W&B. Set
+`media_eval_clip_ids` to pin exact validation clips instead of using the first clips.
 
 The example config uses local paths. To train from a Hugging Face dataset, set:
 
@@ -267,7 +268,8 @@ hf_model_private: true
 
 Supported W&B modes are `disabled`, `offline`, and `online`. Local metrics remain available in
 all modes. W&B records configuration, per-step losses, validation metrics, phase, learning rate,
-Hub provenance, best-checkpoint validation MP4s, console output, and native system telemetry.
+Hub provenance, console output, and native system telemetry. Best-checkpoint MP4s are logged to W&B
+only when `media_eval_log_to_wandb` is enabled.
 
 Model publication is optional. When `hf_model_repo` is set, successful training uploads
 `best.pt`, `final.pt`, metric curves, run metadata, and the generated model card. Uploads create

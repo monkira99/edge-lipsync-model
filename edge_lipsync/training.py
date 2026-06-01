@@ -48,8 +48,9 @@ class TrainConfig:
     media_eval_on_best: bool = True
     media_eval_clip_count: int = 2
     media_eval_clip_ids: tuple[str, ...] = ()
-    media_eval_max_frames_per_clip: int = 250
+    media_eval_max_frames_per_clip: int = 50
     media_eval_fps: float = 25.0
+    media_eval_log_to_wandb: bool = False
     hf_dataset_repo: str = ""
     hf_cache_dir: str = ""
     hf_init_model_repo: str = ""
@@ -472,6 +473,7 @@ def _render_best_media_eval(
     step: int,
     fps: float,
     tracker: Any,
+    log_to_wandb: bool,
 ) -> dict[str, Any]:
     out_dir = run_dir / "media_eval" / f"step_{step:07d}_best"
     artifacts = render_validation_artifacts(
@@ -492,18 +494,31 @@ def _render_best_media_eval(
         }
     )
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    caption = f"best.pt step={step} clips={','.join(selection.clip_ids)}"
-    tracker.log_video(
-        "media_eval/best_validation_grids",
-        str(artifacts["video_path"]),
-        step=step,
-        caption=caption,
-    )
+    wandb_video_logged = False
+    wandb_video_error = ""
+    if log_to_wandb:
+        caption = f"best.pt step={step} clips={','.join(selection.clip_ids)}"
+        try:
+            tracker.log_video(
+                "media_eval/best_validation_grids",
+                str(artifacts["video_path"]),
+                step=step,
+                caption=caption,
+            )
+            wandb_video_logged = True
+        except Exception as exc:
+            wandb_video_error = str(exc)
+            print(
+                f"[media_eval] step={step} status=wandb_video_error error={wandb_video_error}",
+                flush=True,
+            )
     return {
         **artifacts,
         "step": step,
         "clip_ids": list(selection.clip_ids),
         "indices": list(selection.indices),
+        "wandb_video_logged": wandb_video_logged,
+        "wandb_video_error": wandb_video_error,
     }
 
 
@@ -611,6 +626,7 @@ def train(config: TrainConfig) -> Path:
             "clip_ids": list(media_eval_selection.clip_ids),
             "indices": list(media_eval_selection.indices),
             "max_frames_per_clip": config.media_eval_max_frames_per_clip,
+            "log_to_wandb": config.media_eval_log_to_wandb,
         }
     tracker = create_tracker(
         _wandb_config(config),
@@ -687,6 +703,8 @@ def train(config: TrainConfig) -> Path:
                     "learning_rate": learning_rate,
                     "train_loss": loss,
                 }
+                row_logged = False
+                row_printed = False
                 if step % config.validation_interval == 0:
                     validation = run_validation(
                         model,
@@ -695,6 +713,15 @@ def train(config: TrainConfig) -> Path:
                         mixed_precision=mixed_precision,
                     )
                     row.update(validation)
+                    tracker.log_metrics(row, step=step)
+                    row_logged = True
+                    if _should_log_step(
+                        row,
+                        max_steps=config.max_steps,
+                        log_interval=config.log_interval,
+                    ):
+                        print(_format_training_log(row, max_steps=config.max_steps), flush=True)
+                        row_printed = True
                     if validation["val_reconstruction_loss"] < best_val:
                         best_val = validation["val_reconstruction_loss"]
                         atomic_torch_save(
@@ -712,6 +739,15 @@ def train(config: TrainConfig) -> Path:
                             best_path,
                         )
                         if media_eval_selection is not None:
+                            media_eval_dir = run_dir / "media_eval" / f"step_{step:07d}_best"
+                            print(
+                                "[media_eval] "
+                                f"step={step} status=start "
+                                f"clips={','.join(media_eval_selection.clip_ids)} "
+                                f"frames={len(media_eval_selection.indices)} "
+                                f"out_dir={media_eval_dir}",
+                                flush=True,
+                            )
                             media_eval_artifacts.append(
                                 _render_best_media_eval(
                                     model=model,
@@ -722,7 +758,14 @@ def train(config: TrainConfig) -> Path:
                                     step=step,
                                     fps=config.media_eval_fps,
                                     tracker=tracker,
+                                    log_to_wandb=config.media_eval_log_to_wandb,
                                 )
+                            )
+                            print(
+                                "[media_eval] "
+                                f"step={step} status=done "
+                                f"video={media_eval_artifacts[-1]['video_path']}",
+                                flush=True,
                             )
                 if step % config.checkpoint_interval == 0:
                     atomic_torch_save(
@@ -740,8 +783,9 @@ def train(config: TrainConfig) -> Path:
                         run_dir / f"step_{step:07d}.pt",
                     )
                 metrics.append(row)
-                tracker.log_metrics(row, step=step)
-                if _should_log_step(
+                if not row_logged:
+                    tracker.log_metrics(row, step=step)
+                if not row_printed and _should_log_step(
                     row,
                     max_steps=config.max_steps,
                     log_interval=config.log_interval,

@@ -402,6 +402,7 @@ def test_train_renders_and_logs_media_eval_when_best_checkpoint_improves(
                 "indices": tuple(kwargs["dataset"].indices),
                 "out_dir": out_dir,
                 "checkpoint_path": Path(kwargs["checkpoint_path"]),
+                "logged_steps_before_render": [step for _metrics, step in tracker.metrics],
             }
         )
         video_path = out_dir / "validation_grids.mp4"
@@ -446,6 +447,7 @@ def test_train_renders_and_logs_media_eval_when_best_checkpoint_improves(
         media_eval_on_best=True,
         media_eval_clip_count=2,
         media_eval_max_frames_per_clip=2,
+        media_eval_log_to_wandb=True,
     )
 
     training.train(config)
@@ -455,6 +457,7 @@ def test_train_renders_and_logs_media_eval_when_best_checkpoint_improves(
             "indices": (0, 1, 3, 4),
             "out_dir": run_dir / "media_eval" / "step_0000001_best",
             "checkpoint_path": run_dir / "best.pt",
+            "logged_steps_before_render": [1],
         }
     ]
     assert tracker.videos == [
@@ -465,6 +468,54 @@ def test_train_renders_and_logs_media_eval_when_best_checkpoint_improves(
             "caption": "best.pt step=1 clips=clip-a,clip-b",
         }
     ]
+
+
+def test_render_best_media_eval_keeps_training_nonfatal_when_wandb_video_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+
+    class FakeTracker:
+        def log_video(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("wandb upload failed")
+
+    class FakeModel(torch.nn.Module):
+        pass
+
+    def fake_render_validation_artifacts(**kwargs: Any) -> dict[str, Any]:
+        out_dir = Path(kwargs["out_dir"])
+        metadata_path = out_dir / "validation_grids.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text("{}", encoding="utf-8")
+        return {
+            "video_path": str(out_dir / "validation_grids.mp4"),
+            "metadata_path": str(metadata_path),
+            "grid_paths": [],
+            "metrics": {},
+        }
+
+    monkeypatch.setattr(training, "render_validation_artifacts", fake_render_validation_artifacts)
+    selection = training.MediaEvalSelection(
+        dataset=object(),
+        clip_ids=("clip-a",),
+        indices=(0,),
+    )
+
+    artifacts = training._render_best_media_eval(
+        model=FakeModel(),
+        selection=selection,
+        run_dir=tmp_path,
+        best_path=tmp_path / "best.pt",
+        device=torch.device("cpu"),
+        step=500,
+        fps=25.0,
+        tracker=FakeTracker(),
+        log_to_wandb=True,
+    )
+
+    assert artifacts["wandb_video_logged"] is False
+    assert artifacts["wandb_video_error"] == "wandb upload failed"
 
 
 def test_train_logs_writes_final_artifacts_and_publishes_model(
