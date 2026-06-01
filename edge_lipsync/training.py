@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, default_collate
 
 from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset, manifest_sha256
@@ -114,6 +114,17 @@ def validate_batch_shapes(batch: dict[str, Any]) -> None:
             raise ValueError(
                 f"Invalid {key} shape={tuple(tensor.shape)}, expected=[B,{tail_shape}]"
             )
+
+
+def collate_training_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("Cannot collate an empty training batch")
+    return {
+        "face": default_collate([sample["face"] for sample in samples]),
+        "audio": default_collate([sample["audio"] for sample in samples]),
+        "target": default_collate([sample["target"] for sample in samples]),
+        "meta": [sample.get("meta", {}) for sample in samples],
+    }
 
 
 def _forward_model(
@@ -614,12 +625,14 @@ def train(config: TrainConfig) -> Path:
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
+            collate_fn=collate_training_batch,
         )
         val_loader = DataLoader(
             prepared_data.val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
+            collate_fn=collate_training_batch,
         )
         validate_batch_shapes(next(iter(train_loader)))
         optimizer = torch.optim.AdamW(

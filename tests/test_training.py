@@ -79,6 +79,35 @@ def test_validate_batch_shapes_rejects_invalid_audio() -> None:
         validate_batch_shapes(batch)
 
 
+def test_collate_training_batch_keeps_variable_metadata_as_records() -> None:
+    import edge_lipsync.training as training
+
+    batch = [
+        {
+            "face": torch.zeros(6, 160, 160),
+            "audio": torch.zeros(20, 256),
+            "target": torch.zeros(3, 160, 160),
+            "meta": {"clip_id": "clip-a", "flags": ()},
+        },
+        {
+            "face": torch.ones(6, 160, 160),
+            "audio": torch.ones(20, 256),
+            "target": torch.ones(3, 160, 160),
+            "meta": {"clip_id": "clip-b", "flags": ("interpolated_bbox",)},
+        },
+    ]
+
+    collated = training.collate_training_batch(batch)
+
+    assert tuple(collated["face"].shape) == (2, 6, 160, 160)
+    assert tuple(collated["audio"].shape) == (2, 20, 256)
+    assert tuple(collated["target"].shape) == (2, 3, 160, 160)
+    assert collated["meta"] == [
+        {"clip_id": "clip-a", "flags": ()},
+        {"clip_id": "clip-b", "flags": ("interpolated_bbox",)},
+    ]
+
+
 def test_run_validation_reports_reconstruction_mouth_and_temporal_metrics() -> None:
     from edge_lipsync.training import run_validation
 
