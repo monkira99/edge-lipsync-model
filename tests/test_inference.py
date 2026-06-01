@@ -396,6 +396,90 @@ def test_run_manifest_sequence_inference_writes_frame_sequence_mp4(
     assert metadata["artifacts"]["output_mp4"] == str(output_video.resolve())
 
 
+def test_run_hf_dataset_sequence_inference_writes_video_without_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge_lipsync.inference as inference
+    from edge_lipsync.inference import run_hf_dataset_sequence_inference
+
+    checkpoint = tmp_path / "model.pt"
+    _write_checkpoint(checkpoint)
+    frame_1 = np.full((240, 320, 3), 80, dtype=np.uint8)
+    frame_2 = np.full((240, 320, 3), 120, dtype=np.uint8)
+    frame_other = np.full((240, 320, 3), 200, dtype=np.uint8)
+    loaded_dataset = {
+        "val": [
+            {
+                "clip_id": "clip_001",
+                "frame_idx": 2,
+                "audio_idx": 2,
+                "frame": frame_2,
+                "bbox_xyxy": [80, 40, 240, 200],
+                "audio": np.zeros((20, 256), dtype=np.float32),
+                "flags": [],
+            },
+            {
+                "clip_id": "clip_001",
+                "frame_idx": 1,
+                "audio_idx": 1,
+                "frame": frame_1,
+                "bbox_xyxy": [80, 40, 240, 200],
+                "audio": np.zeros((20, 256), dtype=np.float32),
+                "flags": ["interpolated_bbox"],
+            },
+            {
+                "clip_id": "clip_002",
+                "frame_idx": 1,
+                "audio_idx": 1,
+                "frame": frame_other,
+                "bbox_xyxy": [80, 40, 240, 200],
+                "audio": np.zeros((20, 256), dtype=np.float32),
+                "flags": [],
+            },
+        ]
+    }
+    calls: list[tuple[str, str]] = []
+
+    def fake_load_processed_dataset(repo_id: str, *, cache_dir: str = "") -> object:
+        calls.append((repo_id, cache_dir))
+        return loaded_dataset
+
+    monkeypatch.setattr(inference, "load_processed_dataset", fake_load_processed_dataset)
+
+    artifacts = run_hf_dataset_sequence_inference(
+        hf_dataset_repo="owner/avatar-data",
+        split="val",
+        clip_id="auto",
+        out_dir=tmp_path / "hf_sequence",
+        max_frames=0,
+        checkpoint=checkpoint,
+        init_bin="",
+        hf_model_repo="",
+        hf_model_filename="best.pt",
+        hf_cache_dir="/cache",
+        output_mp4="sequence.mp4",
+        device=torch.device("cpu"),
+    )
+
+    frames_dir = tmp_path / "hf_sequence" / "frames"
+    output_video = tmp_path / "hf_sequence" / "sequence.mp4"
+    assert calls == [("owner/avatar-data", "/cache")]
+    assert [path.name for path in sorted(frames_dir.glob("*.png"))] == [
+        "000001.png",
+        "000002.png",
+    ]
+    assert output_video.exists()
+    metadata = json.loads(Path(artifacts["metadata_path"]).read_text(encoding="utf-8"))
+    assert metadata["kind"] == "hf_dataset_sequence_inference"
+    assert metadata["hf_dataset_repo"] == "owner/avatar-data"
+    assert metadata["split"] == "val"
+    assert metadata["clip_id"] == "clip_001"
+    assert [frame["frame_idx"] for frame in metadata["frames"]] == [1, 2]
+    assert metadata["frames"][0]["flags"] == ["interpolated_bbox"]
+    assert metadata["artifacts"]["output_mp4"] == str(output_video.resolve())
+
+
 def test_infer_manifest_sample_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/infer_manifest_sample.py", "--help"],
@@ -413,6 +497,22 @@ def test_infer_manifest_sample_cli_help() -> None:
     assert "--backend" in result.stdout
     assert "--ncnn-param" in result.stdout
     assert "--output-mp4" in result.stdout
+
+
+def test_infer_hf_dataset_sequence_cli_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "tools/infer_hf_dataset_sequence.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Run inference for a Hugging Face dataset sequence" in result.stdout
+    assert "--hf-dataset-repo" in result.stdout
+    assert "--clip-id" in result.stdout
+    assert "--max-frames" in result.stdout
+    assert "--output-mp4" in result.stdout
+    assert "--audio-wav" in result.stdout
 
 
 def test_infer_manifest_sequence_cli_help() -> None:

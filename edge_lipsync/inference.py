@@ -12,8 +12,9 @@ import numpy as np
 import torch
 
 from edge_lipsync.audio_features import extract_bnf_windows_from_wav, get_bnf_window
-from edge_lipsync.dataset import ManifestRecord, load_manifest
+from edge_lipsync.dataset import ManifestRecord, _hf_frame_to_bgr, load_manifest
 from edge_lipsync.eval import chw_norm_to_rgb_u8, prediction_grid_rgb
+from edge_lipsync.hf_datasets import load_processed_dataset
 from edge_lipsync.model import DuixUNet, load_ckpt
 from edge_lipsync.preprocess import FACE_SIZE, ROI_EDGE, make_face_training_sample
 from edge_lipsync.sources import resolve_model_source
@@ -405,6 +406,45 @@ def write_frame_sequence_audio_mp4(
     return output
 
 
+def write_frame_sequence_mp4(
+    *,
+    frames_dir: str | Path,
+    out_path: str | Path,
+    fps: float,
+) -> Path:
+    frame_dir = Path(frames_dir)
+    if not frame_dir.is_dir():
+        raise FileNotFoundError(frame_dir)
+    output = Path(out_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame_paths = sorted(frame_dir.glob("*.png"))
+    if not frame_paths:
+        raise ValueError(f"No PNG frames in {frame_dir}")
+    first_frame = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
+    if first_frame is None:
+        raise RuntimeError(f"Cannot read sequence frame: {frame_paths[0]}")
+    height, width = first_frame.shape[:2]
+    writer = cv2.VideoWriter(
+        str(output),
+        cv2.VideoWriter_fourcc(*"mp4v"),  # pyright: ignore[reportAttributeAccessIssue]
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Cannot open video writer: {output}")
+    try:
+        for frame_path in frame_paths:
+            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise RuntimeError(f"Cannot read sequence frame: {frame_path}")
+            if frame.shape != first_frame.shape:
+                raise ValueError(f"Inconsistent sequence frame shape: {frame_path} {frame.shape}")
+            writer.write(frame)
+    finally:
+        writer.release()
+    return output
+
+
 def _load_audio_bnf(
     *,
     root: Path,
@@ -450,6 +490,49 @@ def _load_records(
     if not records:
         raise ValueError(f"No manifest records selected from {manifest_path}")
     return records
+
+
+def _resolve_hf_split_dataset(dataset: Any, split: str) -> Any:
+    if hasattr(dataset, "keys"):
+        if split not in dataset:
+            raise ValueError(f"Split {split!r} not found in Hugging Face dataset")
+        return dataset[split]
+    if split not in {"", "all"}:
+        raise ValueError("A DatasetDict with the requested split is required")
+    return dataset
+
+
+def _select_hf_sequence_rows(
+    dataset: Any,
+    *,
+    split: str,
+    clip_id: str,
+    max_frames: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    if max_frames < 0:
+        raise ValueError("max_frames must be non-negative")
+    split_dataset = _resolve_hf_split_dataset(dataset, split)
+    if len(split_dataset) == 0:
+        raise ValueError(f"No rows in split={split!r}")
+
+    selected_clip_id = ""
+    if clip_id and clip_id != "auto":
+        selected_clip_id = clip_id
+    else:
+        first_row = split_dataset[0]
+        selected_clip_id = str(first_row["clip_id"])
+
+    rows: list[dict[str, Any]] = []
+    for index in range(len(split_dataset)):
+        row = dict(split_dataset[index])
+        if str(row["clip_id"]) == selected_clip_id:
+            rows.append(row)
+    rows.sort(key=lambda row: (int(row["frame_idx"]), int(row["audio_idx"])))
+    if max_frames:
+        rows = rows[:max_frames]
+    if not rows:
+        raise ValueError(f"No rows for clip_id={selected_clip_id!r} in split={split!r}")
+    return selected_clip_id, rows
 
 
 @torch.inference_mode()
@@ -724,6 +807,145 @@ def run_manifest_sequence_inference(
         "model": model_provenance,
         "alpha": alpha_source,
         "audio_source": audio_source or {},
+        "frames": frame_stats,
+        "artifacts": {
+            "frames_dir": str(frames_dir.resolve()),
+        },
+    }
+    if output_mp4_path is not None:
+        metadata["artifacts"]["output_mp4"] = str(output_mp4_path.resolve())
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    result: dict[str, Any] = {
+        "frames_dir": str(frames_dir.resolve()),
+        "metadata_path": str(metadata_path.resolve()),
+        "metadata": metadata,
+    }
+    if output_mp4_path is not None:
+        result["output_mp4_path"] = str(output_mp4_path.resolve())
+    return result
+
+
+@torch.inference_mode()
+def run_hf_dataset_sequence_inference(
+    *,
+    hf_dataset_repo: str,
+    out_dir: str | Path,
+    split: str = "val",
+    clip_id: str = "auto",
+    max_frames: int = 0,
+    checkpoint: str | Path = "",
+    init_bin: str | Path = "",
+    hf_model_repo: str = "",
+    hf_model_filename: str = "best.pt",
+    hf_cache_dir: str = "",
+    backend: str = "torch",
+    ncnn_param: str | Path = "",
+    audio_wav: str | Path = "",
+    alpha_bin: str | Path = "",
+    output_mp4: str | Path = "output.mp4",
+    fps: float = 25.0,
+    device: torch.device | str = "cpu",
+) -> dict[str, Any]:
+    if not hf_dataset_repo:
+        raise ValueError("hf_dataset_repo is required")
+    loaded_dataset = load_processed_dataset(hf_dataset_repo, cache_dir=hf_cache_dir)
+    selected_clip_id, rows = _select_hf_sequence_rows(
+        loaded_dataset,
+        split=split,
+        clip_id=clip_id,
+        max_frames=max_frames,
+    )
+
+    runtime_device = torch.device(device)
+    alpha_u8, alpha_source = _load_alpha_mask(alpha_bin)
+    runtime, model_provenance = _load_prediction_runtime(
+        backend=backend,
+        ncnn_param=ncnn_param,
+        checkpoint=checkpoint,
+        init_bin=init_bin,
+        hf_model_repo=hf_model_repo,
+        hf_model_filename=hf_model_filename,
+        hf_cache_dir=hf_cache_dir,
+        device=runtime_device,
+    )
+
+    output = Path(out_dir)
+    frames_dir = output / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = output / "metadata.json"
+    frame_stats: list[dict[str, Any]] = []
+
+    for output_index, row in enumerate(rows, start=1):
+        frame = _hf_frame_to_bgr(row["frame"])
+        bbox = tuple(int(value) for value in row["bbox_xyxy"])
+        if len(bbox) != 4:
+            raise ValueError(f"bbox_xyxy must have 4 values: {bbox}")
+        audio = np.asarray(row["audio"], dtype=np.float32)
+        if audio.shape != (20, 256):
+            raise ValueError(f"Invalid audio shape={audio.shape}, expected=(20, 256)")
+
+        face_sample = make_face_training_sample(frame, bbox)
+        prediction = runtime.predict(face_sample.face, audio)
+        prediction_rgb = chw_norm_to_rgb_u8(prediction)
+        restored_frame = restore_prediction_to_frame(
+            frame,
+            bbox,
+            face_sample.roi_168_bgr,
+            prediction_rgb,
+            alpha_u8=alpha_u8,
+        )
+        restored_path = frames_dir / f"{output_index:06d}.png"
+        if not cv2.imwrite(str(restored_path), restored_frame):
+            raise RuntimeError(f"Cannot write sequence frame: {restored_path}")
+        frame_stats.append(
+            {
+                "output_index": output_index,
+                "clip_id": str(row["clip_id"]),
+                "frame_idx": int(row["frame_idx"]),
+                "audio_idx": int(row["audio_idx"]),
+                "bbox_xyxy": list(bbox),
+                "flags": [str(value) for value in row.get("flags", [])],
+                "crop_roi_shape": list(face_sample.roi_168_bgr.shape),
+                "restored_paste_xyxy": list(bbox),
+                "tensor_stats": {
+                    "face": _array_stats(face_sample.face),
+                    "audio_bnf_window": _array_stats(audio),
+                    "prediction": _array_stats(prediction),
+                },
+            }
+        )
+
+    output_mp4_path: Path | None = None
+    if str(output_mp4):
+        output_path = _resolve_output_mp4_path(output, output_mp4)
+        if str(audio_wav):
+            output_mp4_path = write_frame_sequence_audio_mp4(
+                frames_dir=frames_dir,
+                audio_wav=audio_wav,
+                out_path=output_path,
+                fps=fps,
+            )
+        else:
+            output_mp4_path = write_frame_sequence_mp4(
+                frames_dir=frames_dir,
+                out_path=output_path,
+                fps=fps,
+            )
+
+    metadata: dict[str, Any] = {
+        "kind": "hf_dataset_sequence_inference",
+        "hf_dataset_repo": hf_dataset_repo,
+        "split": split,
+        "clip_id": selected_clip_id,
+        "frame_count": len(rows),
+        "fps": float(fps),
+        "model": model_provenance,
+        "alpha": alpha_source,
+        "audio_source": {
+            "source": "wav_mux" if str(audio_wav) else "hf_dataset_audio_windows",
+            "path": str(Path(audio_wav).resolve()) if str(audio_wav) else "",
+        },
         "frames": frame_stats,
         "artifacts": {
             "frames_dir": str(frames_dir.resolve()),

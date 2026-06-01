@@ -353,6 +353,26 @@ and muxes the restored frame sequence with `--audio-wav`. Install the optional N
 `uv sync --extra ncnn` for native-runtime parity. Omit `--backend ncnn --ncnn-param ...` to keep
 the default PyTorch runtime.
 
+If you only have a processed Hugging Face `datasets` repo and no local manifest tree, run sequence
+inference directly from the validation split:
+
+```bash
+.venv/bin/python tools/infer_hf_dataset_sequence.py \
+  --hf-dataset-repo username/avatar-name-dataset \
+  --split val \
+  --clip-id auto \
+  --ckpt /absolute/path/to/runs/avatar_name/best.pt \
+  --alpha-bin /absolute/path/to/weight_168u.bin \
+  --output-mp4 output.mp4 \
+  --out-dir /absolute/path/to/runs/hf_sequence_infer \
+  --max-frames 250 \
+  --device cuda
+```
+
+This selects one clip from the HF split, sorts rows by `frame_idx`, pastes predictions back into
+the stored full frames, and writes an MP4. Add `--audio-wav /path/to/audio.wav` only when you want
+the output MP4 muxed with an external audio file; otherwise the MP4 is video-only.
+
 ## Run Emma Oracle Parity Harness
 
 Run the reproducible comparison against the original Duix-Mobile Emma renderer:
