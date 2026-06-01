@@ -110,14 +110,14 @@ def push_dataset_snapshot(
     _validate_required_paths(root, DATASET_REQUIRED_PATHS)
     client = _client(api)
     client.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
-    commit = client.upload_folder(
+    client.upload_large_folder(
         folder_path=str(root),
         repo_id=repo_id,
         repo_type="dataset",
         allow_patterns=DATASET_UPLOAD_PATTERNS,
-        commit_message=commit_message,
     )
-    revision = str(commit.oid)
+    info = client.dataset_info(repo_id=repo_id)
+    revision = str(info.sha)
     return HubArtifact(
         repo_id=repo_id,
         requested_revision=revision,

@@ -162,7 +162,8 @@ Build all available clips for one speaker by setting `--max-videos 0`:
 ```
 
 When the selected subset looks correct, remove `--dry-run`. Add `--push` to publish the processed
-dataset snapshot after the build:
+dataset snapshot after the build. Dataset uploads use Hugging Face `upload_large_folder()` so large
+processed datasets can resume and commit in smaller batches.
 
 ```bash
 .venv/bin/python tools/build_hf_video_dataset.py \

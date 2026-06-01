@@ -23,6 +23,7 @@ class _FakeApi:
     def __init__(self) -> None:
         self.created: list[dict[str, Any]] = []
         self.uploads: list[dict[str, Any]] = []
+        self.large_uploads: list[dict[str, Any]] = []
 
     def create_repo(self, **kwargs: Any) -> None:
         self.created.append(kwargs)
@@ -31,6 +32,9 @@ class _FakeApi:
         self.uploads.append(kwargs)
         repo_type = kwargs.get("repo_type")
         return _Commit("dataset-commit" if repo_type == "dataset" else "model-commit")
+
+    def upload_large_folder(self, **kwargs: Any) -> None:
+        self.large_uploads.append(kwargs)
 
     def dataset_info(self, **_kwargs: Any) -> _Info:
         return _Info("dataset-sha")
@@ -84,7 +88,9 @@ def _write_model_assets_root(root: Path) -> Path:
     return models_root
 
 
-def test_push_dataset_snapshot_uploads_only_processed_artifacts(tmp_path: Path) -> None:
+def test_push_dataset_snapshot_uses_large_folder_upload_for_processed_artifacts(
+    tmp_path: Path,
+) -> None:
     from edge_lipsync.hub import DATASET_UPLOAD_PATTERNS, push_dataset_snapshot
 
     api = _FakeApi()
@@ -92,7 +98,7 @@ def test_push_dataset_snapshot_uploads_only_processed_artifacts(tmp_path: Path) 
 
     result = push_dataset_snapshot(dataset_root, "owner/avatar-dataset", api=api)
 
-    assert result.resolved_revision == "dataset-commit"
+    assert result.resolved_revision == "dataset-sha"
     assert api.created == [
         {
             "repo_id": "owner/avatar-dataset",
@@ -101,8 +107,10 @@ def test_push_dataset_snapshot_uploads_only_processed_artifacts(tmp_path: Path) 
             "exist_ok": True,
         }
     ]
-    assert api.uploads[0]["allow_patterns"] == DATASET_UPLOAD_PATTERNS
-    assert api.uploads[0]["repo_type"] == "dataset"
+    assert api.uploads == []
+    assert api.large_uploads[0]["allow_patterns"] == DATASET_UPLOAD_PATTERNS
+    assert api.large_uploads[0]["repo_type"] == "dataset"
+    assert api.large_uploads[0]["folder_path"] == str(dataset_root)
 
 
 def test_push_dataset_snapshot_validates_required_files_before_api_call(tmp_path: Path) -> None:
