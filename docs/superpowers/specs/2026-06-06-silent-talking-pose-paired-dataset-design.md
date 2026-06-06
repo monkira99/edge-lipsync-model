@@ -183,10 +183,11 @@ region inside the talking target.
 The initial implementation uses deterministic image sharpness metrics such as Laplacian variance.
 Thresholds are configuration values. The builder publishes metric distributions and previews so
 the defaults can be calibrated against real persona footage. Because the ROIs are normalized to a
-fixed size before measurement, the initial defaults are:
+fixed size before measurement, the initial defaults are separate:
 
 ```text
-minimum_face_laplacian_variance = 60.0
+minimum_source_face_laplacian_variance = 60.0
+minimum_target_face_laplacian_variance = 60.0
 minimum_target_mouth_laplacian_variance = 40.0
 ```
 
@@ -240,8 +241,10 @@ metadata rather than a hard gate.
 
 For a speech window:
 
-- Reject assigned frames when `abs(best_lag_frames) > 2`.
-- Low correlation alone does not reject the frame.
+- Reject assigned frames only when `best_correlation >= 0.20` and
+  `abs(best_lag_frames) > 2`.
+- When `best_correlation < 0.20`, do not use lag as a hard rejection signal because the selected
+  lag is not reliable.
 - Low correlation sets `sync_confidence = "low"` and a quality flag.
 
 For an idle or silence window:
@@ -265,7 +268,7 @@ Every talking frame at 25 FPS is initially a candidate. It must first pass:
 - Talking-track bbox continuity.
 - Face blur.
 - Target-mouth blur.
-- Audio and BNF index availability.
+- Exact audio and BNF window availability.
 - Speech sync lag gate when applicable.
 
 For each remaining talking candidate, compare it against all valid silent frames. The silent video
@@ -300,8 +303,38 @@ width_ratio  = target_width_normalized / source_width_normalized
 height_ratio = target_height_normalized / source_height_normalized
 ```
 
-If no silent frame passes every gate, reject the talking candidate with
+If no silent frame passes the pose and geometry gates, reject the talking candidate with
 `pose_geometry_no_match`.
+
+### Post-crop coordinate alignment
+
+Independent source and target bboxes are allowed only when they produce sufficiently aligned crop
+coordinates. This gate is required because inference restores the model output through the source
+bbox, while the supervised target initially comes from the talking bbox.
+
+For every pose-and-geometry candidate:
+
+1. Project source and target landmarks into their respective ROI coordinates.
+2. Normalize each projected coordinate to `[0, 1]` within its own ROI. This is equivalent to
+   comparing the landmarks after both ROIs are resized to 168 by 168.
+3. Compute stable-landmark RMSE from eye outer corners, nose tip, cheek anchors, and chin.
+4. Compute mouth-center delta from the mean of the two mouth corners. Mouth opening is not part of
+   this center metric.
+
+Initial configurable gates:
+
+```text
+stable_landmark_alignment_rmse <= 0.04
+mouth_center_delta_after_crop  <= 0.04
+```
+
+If pose-and-geometry candidates exist but none pass both alignment gates, reject the talking frame
+with `post_crop_alignment_mismatch`. The matching score is evaluated only after these gates pass.
+
+V1 does not affine-warp the talking frame into silent coordinates. Such a warp would resample the
+supervised target, could hide source-data geometry problems, and adds another transformation to
+the pixel label. It remains a future ablation if strict post-crop gates reject too much otherwise
+usable data.
 
 ### Matching score
 
@@ -341,6 +374,31 @@ resolved deterministically by silent frame index.
 
 A silent frame may be selected by multiple talking frames.
 
+For every retained row, record the number of silent frames that passed every hard gate. The
+selected source is always rank zero because V1 emits only the best match; a constant rank field is
+therefore omitted. Also record the second-best score and score margin when at least two candidates
+exist. The margin is `second_best_matching_score - matching_score`. These fields expose brittle
+matches without storing top-k rows.
+
+## Audio And BNF Alignment
+
+At 16 kHz, the existing 640-sample audio block duration is 40 ms, matching one frame at 25 FPS.
+The builder must use `extract_bnf_windows_from_wav()` so the talking clip produces precomputed BNF
+windows with shape `[T, 20, 256]`.
+
+For target frame index `frame_idx`, using the repository's one-based frame convention:
+
+```text
+audio_idx = frame_idx - 1
+audio = bnf_windows[audio_idx]
+```
+
+The builder requires `0 <= audio_idx < T` and stores that exact `(20, 256)` row in the dataset.
+It must not call a clamping path, shift the index by the estimated sync lag, add new zero-padding,
+or construct a different boundary window. Boundary context and waveform padding remain exactly
+the behavior already implemented by `extract_bnf_windows_from_wav()`. Frames with no exact
+precomputed row are rejected with `bnf_out_of_range`.
+
 ## Speech And Idle Sampling
 
 Every eligible speech frame produces one pair.
@@ -359,7 +417,9 @@ This preserves the future contract without changing current optimization behavio
 If a video has no good speech pairs, it contributes no idle rows by default because the cap is
 defined relative to good speech pairs. The cap uses
 `floor(good_speech_pair_count * 0.10)`, so videos with fewer than ten good speech pairs retain no
-idle row.
+idle row. V1 keeps this strict maximum rather than adding a minimum-row exception that could exceed
+the approved 10% cap. Debug fixtures should contain enough speech pairs when they need to exercise
+idle retention.
 
 ## Train And Validation Splits
 
@@ -385,8 +445,9 @@ split boundary.
 
 ### Primary representation
 
-The builder creates a Hugging Face `DatasetDict` with `train` and `val` splits and saves it locally
-with `DatasetDict.save_to_disk()`.
+The builder creates a Hugging Face `DatasetDict` with `train` and `val` splits and saves it under
+`<snapshot_root>/dataset` with `DatasetDict.save_to_disk()`. The snapshot root is a transport
+package that also contains reports, previews, and completion metadata.
 
 Each row is self-contained for training and does not require access to the original MP4 files.
 To reduce transfer size and repeated preprocessing, the row stores already extracted source and
@@ -434,7 +495,12 @@ center_delta_x: float32
 center_delta_y: float32
 width_ratio: float32
 height_ratio: float32
+stable_landmark_alignment_rmse: float32
+mouth_center_delta_after_crop: float32
 matching_score: float32
+valid_silent_candidate_count: int32
+second_best_matching_score: nullable float32
+matching_score_margin: nullable float32
 source_face_blur: float32
 target_face_blur: float32
 target_mouth_blur: float32
@@ -442,11 +508,13 @@ flags: Sequence(string)
 ```
 
 `pair_id` is stable and contains the talking clip/frame and selected silent frame identity.
+`second_best_matching_score` and `matching_score_margin` are null when only one silent candidate
+passes every gate. Numeric values must not use `NaN` or infinity.
 
 Full-frame paths are not required for training and must not be absolute paths in the portable
 artifact. The build report retains portable source identifiers and original frame indices for
-traceability. Optional local-only previews may include full-frame overlays outside the published
-dataset snapshot.
+traceability. Required portable ROI preview grids live under the snapshot reports. Optional
+full-frame overlays may remain local-only outside the published snapshot.
 
 ## Training Adapter
 
@@ -479,14 +547,15 @@ functions, optimizer, and batch-shape contract do not change.
 
 ### Build machine
 
-1. Save the validated `DatasetDict` to a versioned local directory.
-2. Write build metadata, quality reports, config, and `build_complete.json` inside the snapshot.
+1. Save the validated `DatasetDict` to `<snapshot_root>/dataset`.
+2. Write build metadata, quality reports, preview grids, config, and `build_complete.json` under
+   the same snapshot root.
 3. Upload the complete saved directory with `repo_type="dataset"` to a private Hugging Face
    dataset repository.
 4. Record the returned full commit SHA.
 
-The uploaded artifact is an immutable `save_to_disk()` snapshot, not only a logical dataset rebuilt
-from a moving manifest.
+The uploaded artifact is an immutable package containing the `save_to_disk()` dataset and its
+reports, not only a logical dataset rebuilt from a moving manifest.
 
 ### Training machine
 
@@ -511,7 +580,7 @@ Training preparation:
 4. Verify `build_complete.json`, required splits, features, row counts, and dataset fingerprints.
 5. Resolve and compare the full downloaded commit SHA with the requested revision.
 6. Atomically write the local-only `.snapshot_complete.json` sidecar.
-7. Call `datasets.load_from_disk()` on the local snapshot.
+7. Call `datasets.load_from_disk(<local_snapshot>/dataset)`.
 8. Wrap its splits with `DuixHFDataset`.
 
 All training epochs read local Arrow/image data. There is no per-epoch Hub access and no streaming
@@ -533,15 +602,18 @@ A local working layout may be:
   analysis/
     silent/
     talking/<clip_id>/
-  previews/
-    <clip_id>/
-  quality/
-    silent.json
-    <clip_id>.json
   dataset_snapshot/
-    dataset_dict.json
-    train/
-    val/
+    dataset/
+      dataset_dict.json
+      train/
+      val/
+    reports/
+      quality/
+        silent.json
+        <clip_id>.json
+        <clip_id>_frame_decisions.parquet
+      previews/
+        <clip_id>/
     build_metadata.json
     build_complete.json
 ```
@@ -570,8 +642,45 @@ Per-video reports include:
 - Speech, idle, low-confidence, and rejected-sync window counts.
 - Best-lag and correlation distributions.
 - Pose and geometry no-match count.
+- Post-crop alignment mismatch count and metric distributions.
 - Matching-score distribution.
+- Valid-silent-candidate count and score-margin distributions.
 - Speech and retained-idle pair counts.
+
+Each talking video also writes:
+
+```text
+reports/quality/<clip_id>_frame_decisions.parquet
+```
+
+The table contains one row for every normalized 25 FPS talking frame:
+
+```text
+frame_idx
+split
+status
+reject_reason
+landmark_valid
+bbox_continuity_valid
+source_face_blur
+target_face_blur
+target_mouth_blur
+sync_window_id
+sync_has_speech
+sync_best_lag_frames
+sync_correlation
+sync_confidence
+audio_idx
+bnf_available
+valid_silent_candidate_count
+selected_source_frame_idx
+matching_score
+stable_landmark_alignment_rmse
+mouth_center_delta_after_crop
+```
+
+Rejected rows leave selection fields null. This decision table is an audit artifact and is not read
+by the training loader.
 
 The dataset summary includes:
 
@@ -583,7 +692,16 @@ The dataset summary includes:
 - Snapshot file identity and optional Hub commit SHA.
 
 Previews show source ROI, target ROI, pose deltas, geometry deltas, score, blur metrics, and sync
-metadata for representative pairs and near-threshold pairs.
+metadata. The builder must generate preview groups for:
+
+- Best-score retained pairs.
+- Retained pairs nearest the pose thresholds.
+- Retained pairs nearest the center thresholds.
+- Retained pairs nearest the width or height ratio thresholds.
+- Retained pairs nearest the post-crop alignment thresholds.
+- Low-sync-confidence retained pairs.
+- Retained idle pairs.
+- Rejected examples for the most frequent rejection reasons.
 
 ## Failure Handling
 
@@ -597,6 +715,7 @@ Candidate-level failures are recorded and skipped:
 - Invalid BNF/audio index.
 - Speech sync lag violation.
 - No silent frame inside pose and geometry gates.
+- Post-crop coordinate alignment mismatch.
 
 Clip-level failures produce a failed quality report. The build can continue unless strict mode is
 active.
@@ -619,14 +738,19 @@ The final snapshot is not publishable when:
 - Normalized center deltas.
 - Separate width and height ratio gates.
 - Log-ratio scale distance.
+- Post-crop stable-landmark RMSE and mouth-center gates.
 - Threshold-normalized matching score.
 - Deterministic tie breaking.
 - Silent-frame reuse.
+- Valid-candidate count, second-best score, and margin reporting.
 - Sequence-based bbox jump rejection.
 - Sync window generation and lag search.
 - Nearest-center window assignment.
-- Speech-only lag hard rejection.
+- Speech-only lag hard rejection when correlation meets the confidence threshold.
+- Low-correlation windows never reject by lag.
 - Low-correlation flag behavior.
+- Exact BNF row selection at first, middle, and final valid frame indices.
+- BNF out-of-range rejection without clamping.
 - Idle cap, timeline distribution, and speech-boundary priority.
 - Deterministic video split and single-video contiguous fallback.
 
@@ -637,6 +761,7 @@ The final snapshot is not publishable when:
 - Loader tensors have exact expected shape and dtype.
 - Source tensor and target tensor are constructed from different images.
 - BNF windows remain `(20, 256)`.
+- Stored BNF arrays equal the exact precomputed window for `target_frame_idx - 1`.
 - `sample_weight` is returned only in metadata.
 - Legacy Hugging Face rows remain readable.
 
@@ -644,6 +769,10 @@ The final snapshot is not publishable when:
 
 - `DatasetDict -> save_to_disk -> load_from_disk` round trip.
 - Feature schema and split row counts remain stable.
+- Before and after round trip, inspect the physical cells through `Image(decode=False)` and verify
+  `source_roi` and `target_roi` contain non-empty encoded PNG bytes with no local filesystem path.
+- A downloaded private snapshot decodes both `Image` fields without the build machine's source
+  files.
 - Missing or incomplete snapshots are rejected.
 - A revision-pinned snapshot download resolves to the requested commit.
 - A verified local snapshot skips network access.
@@ -664,7 +793,9 @@ Verify:
 - No retained row violates pose, center, scale, blur, tracking, BNF, or applicable speech-sync
   gates.
 - Quality reports contain rejection counts and required distributions.
-- Preview pairs visibly preserve pose and geometry.
+- The frame-decision Parquet contains exactly one decision for every normalized talking frame.
+- Required preview groups cover best, near-threshold, low-confidence, idle, and rejected examples.
+- Preview pairs visibly preserve pose and post-crop landmark alignment.
 - The saved snapshot reloads locally.
 - `tools/train.py` reads the local snapshot and completes at least one training step with the
   existing model contract.
@@ -676,13 +807,14 @@ The feature is complete when:
 1. Every 25 FPS talking frame is analyzed as an initial candidate.
 2. Every retained speech candidate maps to the best valid silent frame under the approved gates and
    normalized score.
-3. Invalid candidates are rejected with an explicit reason.
-4. Idle rows follow the 10% cap and deterministic selection policy.
-5. The dataset is saved as a self-contained Hugging Face `DatasetDict`.
-6. The dataset can be uploaded and identified by a full Hub commit SHA.
-7. Another machine can resume-download that exact snapshot once, verify it, and train from
+3. Every retained pair passes the post-crop stable-landmark and mouth-center alignment gates.
+4. Invalid candidates are rejected with an explicit frame-level reason.
+5. Idle rows follow the 10% cap and deterministic selection policy.
+6. The dataset is saved as a self-contained Hugging Face `DatasetDict`.
+7. The dataset can be uploaded and identified by a full Hub commit SHA.
+8. Another machine can resume-download that exact snapshot once, verify it, and train from
    `load_from_disk()`.
-8. `tools/train.py` consumes the new dataset without changing `face`, `audio`, or `target` tensor
+9. `tools/train.py` consumes the new dataset without changing `face`, `audio`, or `target` tensor
    shapes.
-9. Tests cover matching, sync, quality gates, serialization, transport, and a one-step training
+10. Tests cover matching, sync, quality gates, serialization, transport, and a one-step training
    integration.
