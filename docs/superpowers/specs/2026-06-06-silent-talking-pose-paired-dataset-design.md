@@ -155,6 +155,11 @@ roll.
 
 Pose is a relative matching signal, not a calibrated biometric measurement.
 
+The pose subset must exclude lips and mouth corners. Eyes, nose, and cheek or face-side anchors
+carry the estimate. Chin is included only if the pilot diagnostic shows that estimated pose remains
+stable across mouth-opening bins. The quality report groups yaw, pitch, and roll distributions by
+mouth-openness quantile so mouth motion cannot silently bias the pose signal.
+
 ### Bbox continuity
 
 Check bbox movement along the original frame sequence before any cross-video matching. Silent and
@@ -323,13 +328,15 @@ For every pose-and-geometry candidate:
 
 Initial configurable gates:
 
-```text
-stable_landmark_alignment_rmse <= 0.04
-mouth_center_delta_after_crop  <= 0.04
+```yaml
+post_crop_alignment:
+  max_stable_landmark_rmse: 0.04
+  max_mouth_center_delta: 0.04
 ```
 
 If pose-and-geometry candidates exist but none pass both alignment gates, reject the talking frame
 with `post_crop_alignment_mismatch`. The matching score is evaluated only after these gates pass.
+Quality reports separately count failures caused by stable-landmark RMSE and mouth-center delta.
 
 V1 does not affine-warp the talking frame into silent coordinates. Such a warp would resample the
 supervised target, could hide source-data geometry problems, and adds another transformation to
@@ -439,7 +446,8 @@ contiguous time segments:
 - The quality summary records `split_mode = "single_video_contiguous_fallback"`.
 
 Idle selection runs within the final assigned split boundaries so samples do not cross a temporal
-split boundary.
+split boundary. Every row's split is determined only by its target frame index. A 2-second sync
+window may overlap the boundary, but its range never determines or changes a row's split.
 
 ## Dataset Artifact
 
@@ -643,8 +651,10 @@ Per-video reports include:
 - Best-lag and correlation distributions.
 - Pose and geometry no-match count.
 - Post-crop alignment mismatch count and metric distributions.
+- Post-crop mismatch counts split by stable-landmark RMSE and mouth-center delta.
 - Matching-score distribution.
 - Valid-silent-candidate count and score-margin distributions.
+- Pose distributions grouped by mouth-openness quantile.
 - Speech and retained-idle pair counts.
 
 Each talking video also writes:
@@ -739,10 +749,14 @@ The final snapshot is not publishable when:
 - Separate width and height ratio gates.
 - Log-ratio scale distance.
 - Post-crop stable-landmark RMSE and mouth-center gates.
+- Full gate ordering: pose and geometry, then post-crop alignment, then scoring and selection.
 - Threshold-normalized matching score.
 - Deterministic tie breaking.
 - Silent-frame reuse.
-- Valid-candidate count, second-best score, and margin reporting.
+- `valid_silent_candidate_count` counts only candidates passing every hard gate, including
+  post-crop alignment.
+- Second-best score and margin use only fully valid candidates; nullable fields are null rather
+  than `NaN` when only one candidate exists.
 - Sequence-based bbox jump rejection.
 - Sync window generation and lag search.
 - Nearest-center window assignment.
@@ -753,6 +767,9 @@ The final snapshot is not publishable when:
 - BNF out-of-range rejection without clamping.
 - Idle cap, timeline distribution, and speech-boundary priority.
 - Deterministic video split and single-video contiguous fallback.
+- Split assignment uses target frame index even when its nearest sync window crosses a split
+  boundary.
+- Pose stability across mouth-openness bins.
 
 ### Dataset tests
 
