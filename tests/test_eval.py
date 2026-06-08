@@ -64,6 +64,43 @@ def test_write_rgb_video_writes_metadata_next_to_render(tmp_path: Path) -> None:
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["kind"] == "validation"
 
 
+def test_render_validation_artifacts_ignores_nullable_sample_metadata(tmp_path: Path) -> None:
+    import torch
+
+    from edge_lipsync.eval import render_validation_artifacts
+
+    class NullableMetaDataset:
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, Any]:
+            return {
+                "face": torch.zeros((6, 160, 160), dtype=torch.float32),
+                "audio": torch.zeros((20, 256), dtype=torch.float32),
+                "target": torch.zeros((3, 160, 160), dtype=torch.float32),
+                "meta": {
+                    "clip_id": "clip",
+                    "second_best_matching_score": None,
+                    "matching_score_margin": None,
+                },
+            }
+
+    class TinyModel(torch.nn.Module):
+        def forward(self, face: torch.Tensor, _audio: torch.Tensor) -> torch.Tensor:
+            return face[:, :3]
+
+    artifacts = render_validation_artifacts(
+        model=TinyModel(),
+        dataset=NullableMetaDataset(),
+        out_dir=tmp_path / "eval",
+        checkpoint_path=tmp_path / "best.pt",
+        device=torch.device("cpu"),
+        max_batches=1,
+    )
+
+    assert Path(str(artifacts["video_path"])).is_file()
+
+
 def test_render_eval_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/render_eval.py", "--help"],

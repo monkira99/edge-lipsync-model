@@ -8,7 +8,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset
 from edge_lipsync.hf_datasets import load_processed_dataset
@@ -155,6 +155,17 @@ def write_rgb_video(
     return metadata_path
 
 
+def _collate_eval_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("Cannot collate an empty eval batch")
+    return {
+        "face": default_collate([sample["face"] for sample in samples]),
+        "audio": default_collate([sample["audio"] for sample in samples]),
+        "target": default_collate([sample["target"] for sample in samples]),
+        "meta": [sample.get("meta", {}) for sample in samples],
+    }
+
+
 @torch.inference_mode()
 def render_validation_artifacts(
     *,
@@ -171,7 +182,7 @@ def render_validation_artifacts(
     output = Path(out_dir)
     grids_dir = output / "grids"
     grids_dir.mkdir(parents=True, exist_ok=True)
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=_collate_eval_batch)
     model = model.to(device).eval()
     predictions: list[np.ndarray] = []
     grid_frames: list[np.ndarray] = []
