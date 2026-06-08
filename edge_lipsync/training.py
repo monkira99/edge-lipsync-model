@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from datasets import load_from_disk
 from torch.utils.data import DataLoader, Subset, default_collate
 
 from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset, manifest_sha256
 from edge_lipsync.eval import render_validation_artifacts
-from edge_lipsync.hf_datasets import load_processed_dataset
-from edge_lipsync.hub import push_model_artifacts
+from edge_lipsync.hub import HubArtifact, pull_dataset_snapshot, push_model_artifacts
 from edge_lipsync.losses import (
     charbonnier_loss,
     combined_reconstruction_loss,
@@ -23,6 +23,8 @@ from edge_lipsync.losses import (
 from edge_lipsync.model import DuixUNet, load_ckpt
 from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
 from edge_lipsync.tracking import WandbConfig, create_tracker
+
+__all__ = ["HubArtifact"]
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,8 @@ class TrainConfig:
     media_eval_fps: float = 25.0
     media_eval_log_to_wandb: bool = False
     hf_dataset_repo: str = ""
+    hf_dataset_revision: str = ""
+    hf_dataset_local_dir: str = ""
     hf_cache_dir: str = ""
     hf_init_model_repo: str = ""
     hf_init_model_filename: str = "best.pt"
@@ -533,6 +537,23 @@ def _dataset_fingerprints(dataset: Any) -> dict[str, str]:
     return fingerprints
 
 
+def _verify_dataset_snapshot(root: Path) -> dict[str, str]:
+    complete = root / "build_complete.json"
+    if not complete.is_file():
+        raise FileNotFoundError(complete)
+    metadata = json.loads(complete.read_text(encoding="utf-8"))
+    dataset_path = root / "dataset"
+    dataset = load_from_disk(dataset_path)
+    if set(dataset) != {"train", "val"}:
+        raise ValueError("Dataset snapshot must contain train and val splits")
+    if len(dataset["train"]) == 0 or len(dataset["val"]) == 0:
+        raise ValueError("Dataset snapshot splits must be non-empty")
+    fingerprints = _dataset_fingerprints(dataset)
+    if metadata.get("dataset_fingerprints") != fingerprints:
+        raise ValueError("Dataset fingerprints do not match build_complete.json")
+    return fingerprints
+
+
 def _write_hf_dataset_source(run_dir: Path, provenance: dict[str, Any]) -> Path:
     path = run_dir / "hf_dataset_source.json"
     path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
@@ -547,14 +568,28 @@ def prepare_training_datasets(
     if bool(config.dataset_root) == bool(config.hf_dataset_repo):
         raise ValueError("Set exactly one of dataset_root or hf_dataset_repo")
     if config.hf_dataset_repo:
-        dataset = load_processed_dataset(config.hf_dataset_repo, cache_dir=config.hf_cache_dir)
+        if not config.hf_dataset_revision:
+            raise ValueError("hf_dataset_revision is required with hf_dataset_repo")
+        if not config.hf_dataset_local_dir:
+            raise ValueError("hf_dataset_local_dir is required with hf_dataset_repo")
+        artifact = pull_dataset_snapshot(
+            config.hf_dataset_repo,
+            ref=config.hf_dataset_revision,
+            local_dir=config.hf_dataset_local_dir,
+            cache_dir=config.hf_cache_dir,
+            verify=_verify_dataset_snapshot,
+        )
+        if artifact.path is None:
+            raise ValueError("Dataset snapshot download returned no local path")
+        dataset = load_from_disk(artifact.path / "dataset")
         provenance: dict[str, Any] = {
-            "source": "huggingface_datasets",
-            "repo_id": config.hf_dataset_repo,
+            "source": "huggingface_snapshot",
+            "repo_id": artifact.repo_id,
+            "requested_ref": artifact.requested_ref,
+            "resolved_ref": artifact.resolved_ref,
+            "path": str(artifact.path),
+            "fingerprints": _dataset_fingerprints(dataset),
         }
-        fingerprints = _dataset_fingerprints(dataset)
-        if fingerprints:
-            provenance["fingerprints"] = fingerprints
         metadata_dir = Path(run_dir) if run_dir is not None else Path(".")
         if run_dir is not None:
             metadata_dir.mkdir(parents=True, exist_ok=True)

@@ -214,17 +214,21 @@ def test_build_model_loads_hub_checkpoint_without_revision(
     assert source["resolved_ref"] == "model-sha"
 
 
-def test_prepare_training_datasets_loads_hf_dataset_without_revision(
+def test_prepare_training_datasets_pulls_revision_then_loads_from_disk(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import edge_lipsync.training as training
 
-    calls: list[tuple[str, dict[str, Any]]] = []
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "dataset").mkdir(parents=True)
     loaded_dataset = {"train": [1], "val": [2]}
+    calls: list[object] = []
 
     class TinyHFDataset:
         def __init__(self, dataset: object, split: str) -> None:
-            calls.append((split, {"dataset": dataset}))
+            self.dataset = dataset
+            self.split = split
 
         def __len__(self) -> int:
             return 1
@@ -236,33 +240,50 @@ def test_prepare_training_datasets_loads_hf_dataset_without_revision(
                 "target": torch.ones(3, 160, 160),
             }
 
-    def fake_load_processed_dataset(repo_id: str, *, cache_dir: str = "") -> object:
-        calls.append(("load", {"repo_id": repo_id, "cache_dir": cache_dir}))
-        return loaded_dataset
-
-    monkeypatch.setattr(training, "load_processed_dataset", fake_load_processed_dataset)
+    monkeypatch.setattr(
+        training,
+        "pull_dataset_snapshot",
+        lambda *args, **kwargs: training.HubArtifact(
+            repo_id="owner/nora-pairs",
+            requested_ref="sha",
+            resolved_ref="sha",
+            path=snapshot,
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "load_from_disk",
+        lambda path: calls.append(path) or loaded_dataset,
+    )
     monkeypatch.setattr(training, "DuixHFDataset", TinyHFDataset)
 
     prepared = training.prepare_training_datasets(
         training.TrainConfig(
-            run_dir="run",
+            run_dir=str(tmp_path / "run"),
             init_bin="/tmp/dh_model.bin",
-            hf_dataset_repo="owner/avatar-data",
-            hf_cache_dir="/cache",
+            hf_dataset_repo="owner/nora-pairs",
+            hf_dataset_revision="sha",
+            hf_dataset_local_dir=str(snapshot),
         )
     )
 
-    assert prepared.provenance == {
-        "source": "huggingface_datasets",
-        "repo_id": "owner/avatar-data",
-    }
+    assert calls == [snapshot / "dataset"]
+    assert prepared.provenance["resolved_ref"] == "sha"
     assert len(prepared.train_dataset) == 1
     assert len(prepared.val_dataset) == 1
-    assert calls == [
-        ("load", {"repo_id": "owner/avatar-data", "cache_dir": "/cache"}),
-        ("train", {"dataset": loaded_dataset}),
-        ("val", {"dataset": loaded_dataset}),
-    ]
+
+
+def test_hf_snapshot_training_requires_revision_and_local_dir() -> None:
+    import edge_lipsync.training as training
+
+    with pytest.raises(ValueError, match="revision"):
+        training.prepare_training_datasets(
+            training.TrainConfig(
+                run_dir="run",
+                init_bin="/tmp/dh_model.bin",
+                hf_dataset_repo="owner/nora-pairs",
+            )
+        )
 
 
 def test_write_run_metadata_records_provenance(tmp_path: Path) -> None:
