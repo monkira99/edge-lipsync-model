@@ -41,6 +41,9 @@ reportPrivateImportUsage = "none"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "integration: requires local model assets and real video fixtures",
+]
 
 [tool.ruff]
 line-length = 100
@@ -51,3 +54,4 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 "edge_lipsync/model.py" = ["E501"]
+"notebooks/*.ipynb" = ["E501", "I001"]

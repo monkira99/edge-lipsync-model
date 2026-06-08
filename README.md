@@ -95,6 +95,50 @@ Dataset processing commands use `tqdm.auto` progress bars for terminal and noteb
 Pass `--no-progress` on the data build CLIs, or set `progress: false` in YAML configs, to disable
 progress bars in CI logs.
 
+## Build Silent/Talking Pose-Paired Dataset
+
+Use this builder when one persona has a silent source video and one or more talking target videos:
+
+```text
+data/<persona>/silent/defaultvideo.mp4
+data/<persona>/talking/*.mp4
+```
+
+The builder analyzes every normalized 25 FPS talking frame, rejects invalid candidates with
+frame-level reasons, pairs retained frames to the best pose/geometry-matched silent frame, and
+saves a portable Hugging Face `DatasetDict` under `<snapshot_root>/dataset`. Rows embed `source_roi`
+and `target_roi` as PNG bytes plus the exact precomputed BNF window, so training does not need the
+original MP4 files.
+
+```bash
+.venv/bin/python tools/build_silent_talking_dataset.py \
+  --config configs/silent_talking_dataset.example.yaml
+```
+
+Inspect `reports/quality/*_frame_decisions.parquet` for one decision per normalized talking frame.
+Preview groups live under `reports/previews/<clip_id>/` and include best matches, near-threshold
+matches, low-sync-confidence retained rows, retained idle rows when available, and frequent
+rejection reasons. `sample_weight` is stored as metadata only in V1; the training loss does not
+apply it.
+
+Hub is transport only for these snapshots. Upload the complete saved directory, record the full
+commit SHA, then download that immutable revision once on the training machine:
+
+```bash
+.venv/bin/python tools/hf_dataset.py push-snapshot \
+  --snapshot-root /absolute/path/to/datasets/nora_pose_pairs \
+  --repo-id username/nora-pose-pairs
+
+.venv/bin/python tools/hf_dataset.py pull-snapshot \
+  --repo-id username/nora-pose-pairs \
+  --revision <full-commit-sha> \
+  --local-dir /persistent/datasets/nora/<full-commit-sha>
+```
+
+Training uses `datasets.load_from_disk(<local_snapshot>/dataset)`. The local
+`.snapshot_complete.json` marker prevents repeat Hub access after the requested repo, full commit
+SHA, and dataset fingerprints have been verified.
+
 ## Build Hugging Face Video Dataset
 
 Use `tools/build_hf_video_dataset.py` for HF datasets that already contain synced MP4 clips. This
@@ -241,10 +285,15 @@ upload is disabled by default to keep Colab training from blocking on large MP4 
 `media_eval_log_to_wandb: true` only when you explicitly want best-checkpoint videos in W&B. Set
 `media_eval_clip_ids` to pin exact validation clips instead of using the first clips.
 
-The example config uses local paths. To train from a Hugging Face dataset, set:
+The example config uses local manifest paths. To train from a revision-pinned pose-paired snapshot,
+leave `dataset_root` empty and set:
 
 ```yaml
-hf_dataset_repo: username/avatar-name-dataset
+dataset_root: ""
+hf_dataset_repo: username/nora-pose-pairs
+hf_dataset_revision: <full-commit-sha>
+hf_dataset_local_dir: /persistent/datasets/nora/<full-commit-sha>
+hf_cache_dir: /persistent/huggingface-cache
 ```
 
 To initialize from a Hugging Face model instead of `init_bin` or `init_ckpt`, set:
