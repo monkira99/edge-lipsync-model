@@ -396,6 +396,148 @@ def test_run_manifest_sequence_inference_writes_frame_sequence_mp4(
     assert metadata["artifacts"]["output_mp4"] == str(output_video.resolve())
 
 
+def test_run_video_inference_accepts_silent_video_and_audio(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import edge_lipsync.inference as inference
+    from edge_lipsync.inference import run_video_inference
+
+    input_video = tmp_path / "silent.mp4"
+    input_audio = tmp_path / "speech.wav"
+    wenet_path = tmp_path / "wenet.onnx"
+    input_video.write_bytes(b"video")
+    input_audio.write_bytes(b"audio")
+    wenet_path.write_bytes(b"onnx")
+    frame_1 = np.full((240, 320, 3), 80, dtype=np.uint8)
+    frame_2 = np.full((240, 320, 3), 120, dtype=np.uint8)
+    commands: list[tuple[str, str]] = []
+
+    class FakeRuntime:
+        def predict(self, face: np.ndarray, audio: np.ndarray) -> np.ndarray:
+            assert face.shape == (6, 160, 160)
+            assert audio.shape == (20, 256)
+            return np.zeros((3, 160, 160), dtype=np.float32)
+
+    class FakeDetector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def detect_bbox(self, _frame_bgr: np.ndarray):
+            self.calls += 1
+            if self.calls == 1:
+                return (80, 40, 240, 200)
+            return None
+
+        def close(self) -> None:
+            pass
+
+    def fake_extract_video_frames(
+        _input_video: str | Path,
+        frames_dir: str | Path,
+        *,
+        fps: float,
+    ) -> int:
+        assert fps == 25.0
+        frame_dir = Path(frames_dir)
+        frame_dir.mkdir(parents=True)
+        cv2.imwrite(str(frame_dir / "000001.png"), frame_1)
+        cv2.imwrite(str(frame_dir / "000002.png"), frame_2)
+        return 2
+
+    def fake_normalize_audio(
+        audio_path: str | Path,
+        out_path: str | Path,
+        *,
+        sample_rate: int,
+    ) -> Path:
+        assert Path(audio_path) == input_audio
+        assert sample_rate == 16000
+        normalized = Path(out_path)
+        normalized.parent.mkdir(parents=True, exist_ok=True)
+        normalized.write_bytes(b"wav")
+        return normalized
+
+    def fake_write_mp4(
+        *,
+        frames_dir: str | Path,
+        audio_wav: str | Path,
+        out_path: str | Path,
+        fps: float,
+    ) -> Path:
+        assert Path(frames_dir).is_dir()
+        assert Path(audio_wav).name == "audio_16k.wav"
+        assert fps == 25.0
+        output = Path(out_path)
+        output.write_bytes(b"mp4")
+        commands.append((str(frames_dir), str(audio_wav)))
+        return output
+
+    monkeypatch.setattr(
+        inference,
+        "_extract_video_frames",
+        fake_extract_video_frames,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        inference,
+        "_normalize_audio_for_inference",
+        fake_normalize_audio,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        inference,
+        "extract_bnf_windows_from_wav",
+        lambda _wav, _wenet: np.zeros((30, 20, 256), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        inference,
+        "_load_prediction_runtime",
+        lambda **_kwargs: (FakeRuntime(), {"source": "fake", "backend": "torch"}),
+    )
+    monkeypatch.setattr(
+        inference,
+        "_create_video_bbox_detector",
+        lambda **_kwargs: FakeDetector(),
+        raising=False,
+    )
+    monkeypatch.setattr(inference, "write_frame_sequence_audio_mp4", fake_write_mp4)
+
+    artifacts = run_video_inference(
+        input_video=input_video,
+        audio=input_audio,
+        out_dir=tmp_path / "infer_video",
+        checkpoint=tmp_path / "best.pt",
+        init_bin="",
+        hf_model_repo="",
+        hf_model_filename="best.pt",
+        hf_cache_dir="",
+        wenet_onnx=wenet_path,
+        output_mp4="output.mp4",
+        fps=25.0,
+        device=torch.device("cpu"),
+    )
+
+    frames_dir = tmp_path / "infer_video" / "frames"
+    output_video = tmp_path / "infer_video" / "output.mp4"
+    assert artifacts["output_mp4_path"] == str(output_video.resolve())
+    assert output_video.exists()
+    assert commands == [(str(frames_dir), str(tmp_path / "infer_video" / "audio_16k.wav"))]
+    restored_1 = cv2.imread(str(frames_dir / "000001.png"), cv2.IMREAD_COLOR)
+    restored_2 = cv2.imread(str(frames_dir / "000002.png"), cv2.IMREAD_COLOR)
+    assert restored_1 is not None
+    assert restored_2 is not None
+    assert not np.array_equal(restored_1, frame_1)
+    assert np.array_equal(restored_2, frame_2)
+    metadata = json.loads(Path(artifacts["metadata_path"]).read_text(encoding="utf-8"))
+    assert metadata["kind"] == "video_inference"
+    assert metadata["frame_count"] == 2
+    assert metadata["processed_frame_count"] == 1
+    assert metadata["skipped_frame_count"] == 1
+    assert metadata["frames"][1]["status"] == "skipped"
+    assert metadata["frames"][1]["reason"] == "face_detection_failed"
+
+
 def test_run_hf_dataset_sequence_inference_writes_video_without_manifest(
     tmp_path: Path,
     monkeypatch,
@@ -529,3 +671,18 @@ def test_infer_manifest_sequence_cli_help() -> None:
     assert "--alpha-bin" in result.stdout
     assert "--backend" in result.stdout
     assert "--ncnn-param" in result.stdout
+
+
+def test_infer_video_cli_help() -> None:
+    result = subprocess.run(
+        [sys.executable, "tools/infer_video.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "Run inference from a silent input video and driving audio" in result.stdout
+    assert "--input-video" in result.stdout
+    assert "--audio" in result.stdout
+    assert "--output-mp4" in result.stdout
+    assert "--landmark-model-asset-path" in result.stdout

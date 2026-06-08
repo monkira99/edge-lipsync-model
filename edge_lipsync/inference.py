@@ -15,8 +15,9 @@ from edge_lipsync.audio_features import extract_bnf_windows_from_wav, get_bnf_wi
 from edge_lipsync.dataset import ManifestRecord, _hf_frame_to_bgr, load_manifest
 from edge_lipsync.eval import chw_norm_to_rgb_u8, prediction_grid_rgb
 from edge_lipsync.hf_datasets import load_processed_dataset
+from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
 from edge_lipsync.model import DuixUNet, load_ckpt
-from edge_lipsync.preprocess import FACE_SIZE, ROI_EDGE, make_face_training_sample
+from edge_lipsync.preprocess import FACE_SIZE, ROI_EDGE, BBox, make_face_training_sample
 from edge_lipsync.sources import resolve_model_source
 
 
@@ -178,6 +179,46 @@ def _load_prediction_runtime(
     return TorchPredictionRuntime(model, device), {**provenance, "backend": "torch"}
 
 
+class _HaarVideoDetector:
+    def __init__(self) -> None:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"  # pyright: ignore[reportAttributeAccessIssue]
+        self.detector = cv2.CascadeClassifier(cascade_path)
+
+    def detect_bbox(self, frame_bgr: np.ndarray) -> BBox | None:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        faces = self.detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+        if len(faces) == 0:
+            return None
+        x, y, width, height = max(faces, key=lambda rect: int(rect[2]) * int(rect[3]))
+        return int(x), int(y), int(x + width), int(y + height)
+
+    def close(self) -> None:
+        pass
+
+
+def _create_video_bbox_detector(
+    *,
+    bbox_detector: str = "mediapipe_face_landmarker",
+    landmark_model_asset_path: str | None = None,
+    landmark_min_detection_confidence: float = 0.5,
+    landmark_min_tracking_confidence: float = 0.5,
+    landmark_refine_landmarks: bool = True,
+) -> Any:
+    if bbox_detector == "haar":
+        return _HaarVideoDetector()
+    if bbox_detector in {"mediapipe_face_landmarker", "mediapipe_face_mesh"}:
+        return MediaPipeFaceLandmarkerDetector(
+            model_asset_path=landmark_model_asset_path,
+            min_detection_confidence=landmark_min_detection_confidence,
+            min_tracking_confidence=landmark_min_tracking_confidence,
+            refine_landmarks=landmark_refine_landmarks,
+        )
+    raise ValueError(
+        "Unsupported bbox_detector="
+        f"{bbox_detector!r}; expected mediapipe_face_landmarker, mediapipe_face_mesh, or haar"
+    )
+
+
 def _write_rgb_image(path: Path, rgb: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
@@ -196,6 +237,67 @@ def _run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     if process.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(command)}\nSTDERR:\n{process.stderr}")
     return process
+
+
+def _extract_video_frames(
+    input_video: str | Path,
+    frames_dir: str | Path,
+    *,
+    fps: float,
+) -> int:
+    video_path = Path(input_video)
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+    frame_dir = Path(frames_dir)
+    if frame_dir.exists():
+        shutil.rmtree(frame_dir)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _require_tool("ffmpeg")
+    _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps={float(fps)}",
+            str(frame_dir / "%06d.png"),
+        ]
+    )
+    frame_count = len(list(frame_dir.glob("*.png")))
+    if frame_count <= 0:
+        raise ValueError(f"No frames extracted from {video_path}")
+    return frame_count
+
+
+def _normalize_audio_for_inference(
+    audio_path: str | Path,
+    out_path: str | Path,
+    *,
+    sample_rate: int,
+) -> Path:
+    audio = Path(audio_path)
+    if not audio.exists():
+        raise FileNotFoundError(audio)
+    output = Path(out_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _require_tool("ffmpeg")
+    _run_command(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(audio),
+            "-ac",
+            "1",
+            "-ar",
+            str(int(sample_rate)),
+            "-acodec",
+            "pcm_s16le",
+            str(output),
+        ]
+    )
+    return output
 
 
 def _array_stats(array: np.ndarray) -> dict[str, Any]:
@@ -533,6 +635,189 @@ def _select_hf_sequence_rows(
     if not rows:
         raise ValueError(f"No rows for clip_id={selected_clip_id!r} in split={split!r}")
     return selected_clip_id, rows
+
+
+@torch.inference_mode()
+def run_video_inference(
+    *,
+    input_video: str | Path,
+    audio: str | Path,
+    out_dir: str | Path,
+    checkpoint: str | Path = "",
+    init_bin: str | Path = "",
+    hf_model_repo: str = "",
+    hf_model_filename: str = "best.pt",
+    hf_cache_dir: str = "",
+    backend: str = "torch",
+    ncnn_param: str | Path = "",
+    wenet_onnx: str | Path = "",
+    alpha_bin: str | Path = "",
+    output_mp4: str | Path = "output.mp4",
+    fps: float = 25.0,
+    sample_rate: int = 16000,
+    bbox_detector: str = "mediapipe_face_landmarker",
+    landmark_model_asset_path: str | None = None,
+    landmark_min_detection_confidence: float = 0.5,
+    landmark_min_tracking_confidence: float = 0.5,
+    landmark_refine_landmarks: bool = True,
+    device: torch.device | str = "cpu",
+) -> dict[str, Any]:
+    video_path = Path(input_video)
+    audio_path = Path(audio)
+    if not video_path.exists():
+        raise FileNotFoundError(video_path)
+    if not audio_path.exists():
+        raise FileNotFoundError(audio_path)
+    if not str(wenet_onnx):
+        raise ValueError("wenet_onnx is required")
+    wenet_path = Path(wenet_onnx)
+    if not wenet_path.exists():
+        raise FileNotFoundError(wenet_path)
+
+    output = Path(out_dir)
+    source_frames_dir = output / "source_frames"
+    frames_dir = output / "frames"
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = output / "metadata.json"
+    normalized_audio = _normalize_audio_for_inference(
+        audio_path,
+        output / "audio_16k.wav",
+        sample_rate=sample_rate,
+    )
+    frame_count = _extract_video_frames(video_path, source_frames_dir, fps=fps)
+    bnf = extract_bnf_windows_from_wav(normalized_audio, wenet_path)
+    if bnf.ndim != 3 or bnf.shape[1:] != (20, 256):
+        raise ValueError(f"Expected BNF windows [T,20,256], got {bnf.shape}")
+
+    runtime_device = torch.device(device)
+    alpha_u8, alpha_source = _load_alpha_mask(alpha_bin)
+    runtime, model_provenance = _load_prediction_runtime(
+        backend=backend,
+        ncnn_param=ncnn_param,
+        checkpoint=checkpoint,
+        init_bin=init_bin,
+        hf_model_repo=hf_model_repo,
+        hf_model_filename=hf_model_filename,
+        hf_cache_dir=hf_cache_dir,
+        device=runtime_device,
+    )
+    detector = _create_video_bbox_detector(
+        bbox_detector=bbox_detector,
+        landmark_model_asset_path=landmark_model_asset_path,
+        landmark_min_detection_confidence=landmark_min_detection_confidence,
+        landmark_min_tracking_confidence=landmark_min_tracking_confidence,
+        landmark_refine_landmarks=landmark_refine_landmarks,
+    )
+
+    frame_stats: list[dict[str, Any]] = []
+    processed = 0
+    skipped = 0
+    try:
+        for frame_idx in range(1, frame_count + 1):
+            frame_path = source_frames_dir / f"{frame_idx:06d}.png"
+            frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise FileNotFoundError(frame_path)
+            audio_idx = frame_idx - 1
+            restored_frame = frame
+            row: dict[str, Any] = {
+                "output_index": frame_idx,
+                "frame_idx": frame_idx,
+                "audio_idx": audio_idx,
+                "source_frame_path": str(frame_path.resolve()),
+            }
+            if audio_idx < 0 or audio_idx >= int(bnf.shape[0]):
+                skipped += 1
+                row.update({"status": "skipped", "reason": "bnf_out_of_range"})
+            else:
+                bbox = detector.detect_bbox(frame)
+                if bbox is None:
+                    skipped += 1
+                    row.update({"status": "skipped", "reason": "face_detection_failed"})
+                else:
+                    face_sample = make_face_training_sample(frame, bbox)
+                    audio_window = get_bnf_window(bnf, audio_idx)
+                    prediction = runtime.predict(face_sample.face, audio_window)
+                    prediction_rgb = chw_norm_to_rgb_u8(prediction)
+                    restored_frame = restore_prediction_to_frame(
+                        frame,
+                        bbox,
+                        face_sample.roi_168_bgr,
+                        prediction_rgb,
+                        alpha_u8=alpha_u8,
+                    )
+                    processed += 1
+                    row.update(
+                        {
+                            "status": "processed",
+                            "bbox_xyxy": list(bbox),
+                            "crop_roi_shape": list(face_sample.roi_168_bgr.shape),
+                            "restored_paste_xyxy": list(bbox),
+                            "tensor_stats": {
+                                "face": _array_stats(face_sample.face),
+                                "audio_bnf_window": _array_stats(audio_window),
+                                "prediction": _array_stats(prediction),
+                            },
+                        }
+                    )
+
+            restored_path = frames_dir / f"{frame_idx:06d}.png"
+            if not cv2.imwrite(str(restored_path), restored_frame):
+                raise RuntimeError(f"Cannot write sequence frame: {restored_path}")
+            row["restored_frame_path"] = str(restored_path.resolve())
+            frame_stats.append(row)
+    finally:
+        detector.close()
+
+    output_mp4_path: Path | None = None
+    if str(output_mp4):
+        output_mp4_path = write_frame_sequence_audio_mp4(
+            frames_dir=frames_dir,
+            audio_wav=normalized_audio,
+            out_path=_resolve_output_mp4_path(output, output_mp4),
+            fps=fps,
+        )
+
+    metadata: dict[str, Any] = {
+        "kind": "video_inference",
+        "input_video": str(video_path.resolve()),
+        "input_audio": str(audio_path.resolve()),
+        "normalized_audio": str(normalized_audio.resolve()),
+        "frame_count": frame_count,
+        "processed_frame_count": processed,
+        "skipped_frame_count": skipped,
+        "fps": float(fps),
+        "sample_rate": int(sample_rate),
+        "bbox_detector": bbox_detector,
+        "model": model_provenance,
+        "alpha": alpha_source,
+        "audio_source": {
+            "source": "audio_file",
+            "path": str(audio_path.resolve()),
+            "wenet_onnx": str(wenet_path.resolve()),
+            "bnf_shape": list(bnf.shape),
+        },
+        "frames": frame_stats,
+        "artifacts": {
+            "source_frames_dir": str(source_frames_dir.resolve()),
+            "frames_dir": str(frames_dir.resolve()),
+        },
+    }
+    if output_mp4_path is not None:
+        metadata["artifacts"]["output_mp4"] = str(output_mp4_path.resolve())
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    result: dict[str, Any] = {
+        "frames_dir": str(frames_dir.resolve()),
+        "source_frames_dir": str(source_frames_dir.resolve()),
+        "metadata_path": str(metadata_path.resolve()),
+        "metadata": metadata,
+    }
+    if output_mp4_path is not None:
+        result["output_mp4_path"] = str(output_mp4_path.resolve())
+    return result
 
 
 @torch.inference_mode()
