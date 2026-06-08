@@ -24,6 +24,8 @@ stabilization_lr_scale: 0.1
 validation_interval: 100
 checkpoint_interval: 100
 log_interval: 10
+early_stopping_patience: 0
+early_stopping_min_delta: 0.0
 media_eval_on_best: true
 media_eval_clip_count: 2
 media_eval_clip_ids: []

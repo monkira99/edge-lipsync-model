@@ -47,6 +47,8 @@ class TrainConfig:
     validation_interval: int = 100
     checkpoint_interval: int = 100
     log_interval: int = 10
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
     media_eval_on_best: bool = True
     media_eval_clip_count: int = 2
     media_eval_clip_ids: tuple[str, ...] = ()
@@ -184,6 +186,7 @@ def run_validation(
 ) -> dict[str, float]:
     model.eval()
     reconstruction: list[float] = []
+    total: list[float] = []
     mouth: list[float] = []
     temporal: list[float] = []
     previous_pred: torch.Tensor | None = None
@@ -193,6 +196,7 @@ def run_validation(
         target = batch["target"].to(device=device, dtype=torch.float32)
         with torch.autocast(device_type=device.type, enabled=mixed_precision):
             pred = model(face, audio)
+            total.append(float(combined_reconstruction_loss(pred, target).cpu()))
             reconstruction.append(float(charbonnier_loss(pred, target).cpu()))
             mouth.append(float(mouth_weighted_l1(pred, target).cpu()))
         for current_pred in pred:
@@ -202,6 +206,7 @@ def run_validation(
     if not reconstruction:
         raise ValueError("Validation loader produced no batches")
     return {
+        "val_loss": sum(total) / len(total),
         "val_reconstruction_loss": sum(reconstruction) / len(reconstruction),
         "val_mouth_loss": sum(mouth) / len(mouth),
         "val_temporal_delta": sum(temporal) / len(temporal) if temporal else 0.0,
@@ -282,7 +287,7 @@ def _format_training_log(row: dict[str, float | int | str], *, max_steps: int) -
         f"lr={float(row['learning_rate']):.3g}",
         f"train_loss={float(row['train_loss']):.6g}",
     ]
-    for key in ("val_reconstruction_loss", "val_mouth_loss", "val_temporal_delta"):
+    for key in ("val_loss", "val_reconstruction_loss", "val_mouth_loss", "val_temporal_delta"):
         if key in row:
             parts.append(f"{key}={float(row[key]):.6g}")
     return " ".join(parts)
@@ -301,6 +306,7 @@ def _should_log_step(
         step == 1
         or step == max_steps
         or step % log_interval == 0
+        or "val_loss" in row
         or "val_reconstruction_loss" in row
     )
 
@@ -632,6 +638,10 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
     if config.log_interval < 0:
         raise ValueError("log_interval must be >= 0")
+    if config.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be >= 0")
+    if config.early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0")
     if config.media_eval_on_best and config.media_eval_fps <= 0:
         raise ValueError("media_eval_fps must be positive")
     run_dir = Path(config.run_dir)
@@ -695,7 +705,12 @@ def train(config: TrainConfig) -> Path:
 
         metrics: list[dict[str, float | int | str]] = []
         media_eval_artifacts: list[dict[str, Any]] = []
-        best_val = float("inf")
+        best_val_loss = float("inf")
+        early_stopping_best_val_loss = float("inf")
+        best_metrics: dict[str, float | int | str] | None = None
+        validations_without_improvement = 0
+        early_stop_reason = ""
+        early_stop_step = 0
         best_path = run_dir / "best.pt"
         step = 0
         epoch = 0
@@ -704,7 +719,7 @@ def train(config: TrainConfig) -> Path:
         tracker.finish(exit_code=1)
         raise
     try:
-        while step < config.max_steps:
+        while step < config.max_steps and not early_stop_reason:
             epoch += 1
             for batch in train_loader:
                 step += 1
@@ -748,6 +763,32 @@ def train(config: TrainConfig) -> Path:
                         mixed_precision=mixed_precision,
                     )
                     row.update(validation)
+                    val_loss = float(validation["val_loss"])
+                    checkpoint_improved = val_loss < best_val_loss
+                    early_stopping_improved = (
+                        val_loss
+                        < early_stopping_best_val_loss - config.early_stopping_min_delta
+                    )
+                    if checkpoint_improved:
+                        best_val_loss = val_loss
+                        best_metrics = dict(row)
+                    if early_stopping_improved:
+                        early_stopping_best_val_loss = val_loss
+                        validations_without_improvement = 0
+                    else:
+                        validations_without_improvement += 1
+                        if (
+                            config.early_stopping_patience > 0
+                            and validations_without_improvement >= config.early_stopping_patience
+                        ):
+                            early_stop_reason = "val_loss_patience"
+                            early_stop_step = step
+                            row["early_stop_reason"] = early_stop_reason
+                            row["early_stop_patience"] = config.early_stopping_patience
+                            row["early_stop_bad_validation_count"] = (
+                                validations_without_improvement
+                            )
+                            row["best_val_loss"] = best_val_loss
                     tracker.log_metrics(row, step=step)
                     row_logged = True
                     if _should_log_step(
@@ -757,8 +798,7 @@ def train(config: TrainConfig) -> Path:
                     ):
                         print(_format_training_log(row, max_steps=config.max_steps), flush=True)
                         row_printed = True
-                    if validation["val_reconstruction_loss"] < best_val:
-                        best_val = validation["val_reconstruction_loss"]
+                    if checkpoint_improved:
                         atomic_torch_save(
                             _checkpoint_payload(
                                 model=model,
@@ -826,7 +866,7 @@ def train(config: TrainConfig) -> Path:
                     log_interval=config.log_interval,
                 ):
                     print(_format_training_log(row, max_steps=config.max_steps), flush=True)
-                if step >= config.max_steps:
+                if early_stop_reason or step >= config.max_steps:
                     break
 
         _write_metrics(metrics, run_dir)
@@ -882,8 +922,18 @@ def train(config: TrainConfig) -> Path:
             latest_media_eval = media_eval_artifacts[-1]
             summary["best_media_eval_video"] = latest_media_eval["video_path"]
             summary["best_media_eval_metadata"] = latest_media_eval["metadata_path"]
-        if best_val != float("inf"):
-            summary["best_val_reconstruction_loss"] = best_val
+        if best_metrics is not None:
+            if "val_loss" in best_metrics:
+                summary["best_val_loss"] = float(best_metrics["val_loss"])
+            if "val_reconstruction_loss" in best_metrics:
+                summary["best_val_reconstruction_loss"] = float(
+                    best_metrics["val_reconstruction_loss"]
+                )
+        if early_stop_reason:
+            summary["early_stop_reason"] = early_stop_reason
+            summary["early_stop_step"] = early_stop_step
+            summary["early_stop_patience"] = config.early_stopping_patience
+            summary["early_stop_bad_validation_count"] = validations_without_improvement
         if config.hf_model_repo:
             model_artifact = push_model_artifacts(
                 run_dir,

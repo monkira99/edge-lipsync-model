@@ -108,7 +108,8 @@ def test_collate_training_batch_keeps_variable_metadata_as_records() -> None:
     ]
 
 
-def test_run_validation_reports_reconstruction_mouth_and_temporal_metrics() -> None:
+def test_run_validation_reports_total_reconstruction_mouth_and_temporal_metrics() -> None:
+    from edge_lipsync.losses import combined_reconstruction_loss
     from edge_lipsync.training import run_validation
 
     model = _FaceAudioModel()
@@ -126,7 +127,18 @@ def test_run_validation_reports_reconstruction_mouth_and_temporal_metrics() -> N
     ]
 
     metrics = run_validation(model, batches, torch.device("cpu"))
+    with torch.no_grad():
+        expected_val_loss = sum(
+            float(
+                combined_reconstruction_loss(
+                    model(batch["face"], batch["audio"]),
+                    batch["target"],
+                )
+            )
+            for batch in batches
+        ) / len(batches)
 
+    assert metrics["val_loss"] == pytest.approx(expected_val_loss)
     assert metrics["val_reconstruction_loss"] > 0
     assert metrics["val_mouth_loss"] > 0
     assert metrics["val_temporal_delta"] > 0
@@ -719,7 +731,112 @@ def test_train_prints_progress_rows(
     out = capsys.readouterr().out
     assert "[train] step=1/1" in out
     assert "train_loss=" in out
+    assert "val_loss=" in out
     assert "val_reconstruction_loss=" in out
+
+
+def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    class FakeTracker:
+        provenance = {"mode": "offline", "run_id": "run-id", "run_url": "run-url"}
+
+        def __init__(self) -> None:
+            self.logged: list[tuple[dict[str, Any], int]] = []
+            self.summary: dict[str, Any] = {}
+            self.exit_codes: list[int] = []
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            self.logged.append((metrics, step))
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            self.summary.update(values)
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            self.exit_codes.append(exit_code)
+
+    tracker = FakeTracker()
+    validation_losses = iter((1.0, 0.95, 0.94))
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(training, "run_train_step", lambda **_kwargs: 0.25)
+    monkeypatch.setattr(
+        training,
+        "run_validation",
+        lambda *_args, **_kwargs: {
+            "val_loss": next(validation_losses),
+            "val_reconstruction_loss": 1.0,
+            "val_mouth_loss": 1.0,
+            "val_temporal_delta": 0.0,
+        },
+    )
+
+    training.train(
+        training.TrainConfig(
+            dataset_root=str(dataset_root),
+            manifest="manifest.jsonl",
+            run_dir=str(run_dir),
+            init_bin="/tmp/dh_model.bin",
+            device="cpu",
+            max_steps=5,
+            warmup_steps=0,
+            stabilization_steps=0,
+            validation_interval=1,
+            checkpoint_interval=10,
+            early_stopping_patience=1,
+            early_stopping_min_delta=0.1,
+            media_eval_on_best=False,
+        )
+    )
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    final_checkpoint = torch.load(run_dir / "final.pt", map_location="cpu", weights_only=False)
+
+    assert [row["step"] for row in metrics] == [1, 2]
+    assert metrics[-1]["early_stop_reason"] == "val_loss_patience"
+    assert best_checkpoint["step"] == 2
+    assert final_checkpoint["step"] == 2
+    assert tracker.summary["early_stop_reason"] == "val_loss_patience"
+    assert tracker.summary["early_stop_step"] == 2
+    assert tracker.exit_codes == [0]
 
 
 def test_train_finishes_tracker_with_error_code_when_step_fails(

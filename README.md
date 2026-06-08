@@ -276,7 +276,13 @@ Training writes atomic checkpoints, `best.pt`, `final.pt`, `metrics.json`, `metr
 `run_metadata.json`, and a model card. Checkpoints include the dataset manifest hash, training
 config, step, epoch, metrics, initialization source, dataset provenance, and W&B run provenance.
 The train loop also prints concise progress rows to stdout every `log_interval` steps and whenever
-validation runs, which is useful in Colab notebooks.
+validation runs, which is useful in Colab notebooks. Validation rows include `val_loss`, the same
+combined reconstruction objective used for training, plus reconstruction, mouth, and temporal
+metrics. `best.pt` is selected by `val_loss`.
+
+Early stopping is disabled by default. Set `early_stopping_patience` to the number of validation
+runs allowed without a `val_loss` improvement, and optionally set `early_stopping_min_delta` for the
+minimum improvement threshold.
 
 When `media_eval_on_best` is enabled, every new `best.pt` renders a validation grid MP4 from the
 first `media_eval_clip_count` unique clips in the validation split. The selected clip IDs and frame
