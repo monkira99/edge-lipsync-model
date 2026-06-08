@@ -166,6 +166,11 @@ def rotation_matrix_to_euler(rotation: np.ndarray) -> HeadPose:
     )
 
 
+def _angle_delta_degrees(target: float, source: float) -> float:
+    delta = (target - source + 180.0) % 360.0 - 180.0
+    return 180.0 if delta == -180.0 else delta
+
+
 def estimate_head_pose(
     landmarks: Mapping[int, Point],
     frame_shape: tuple[int, ...],
@@ -502,9 +507,9 @@ def match_silent_observation(
             (source.frame_height, source.frame_width, 3),
         )
         pose_delta = HeadPose(
-            yaw=target.pose.yaw - source.pose.yaw,
-            pitch=target.pose.pitch - source.pose.pitch,
-            roll=target.pose.roll - source.pose.roll,
+            yaw=_angle_delta_degrees(target.pose.yaw, source.pose.yaw),
+            pitch=_angle_delta_degrees(target.pose.pitch, source.pose.pitch),
+            roll=_angle_delta_degrees(target.pose.roll, source.pose.roll),
         )
         center_delta_x = target_geometry.center_x - source_geometry.center_x
         center_delta_y = target_geometry.center_y - source_geometry.center_y

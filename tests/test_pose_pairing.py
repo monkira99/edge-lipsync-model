@@ -249,6 +249,37 @@ def test_matching_reports_pose_geometry_no_match_before_alignment() -> None:
         match_silent_observation(target, [source], MatchConfig())
 
 
+def test_matching_uses_shortest_angle_delta_for_roll_wraparound() -> None:
+    from edge_lipsync.pose_pairing import (
+        FrameObservation,
+        HeadPose,
+        MatchConfig,
+        match_silent_observation,
+    )
+
+    def observation(frame_idx: int, roll: float) -> FrameObservation:
+        return FrameObservation(
+            frame_idx=frame_idx,
+            bbox_xyxy=(50, 40, 150, 160),
+            frame_width=200,
+            frame_height=200,
+            landmarks=_landmarks(),
+            pose=HeadPose(yaw=0.0, pitch=0.0, roll=roll),
+            face_blur=100.0,
+            mouth_blur=100.0,
+            mouth_open=0.2,
+            landmark_valid=True,
+        )
+
+    result = match_silent_observation(
+        observation(10, -179.0),
+        [observation(1, 179.0)],
+        MatchConfig(),
+    )
+
+    assert result.pose_delta.roll == pytest.approx(2.0)
+
+
 def test_assign_video_splits_keeps_each_clip_in_one_split() -> None:
     from edge_lipsync.pose_pairing import assign_video_splits
 
