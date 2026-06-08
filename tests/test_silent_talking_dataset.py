@@ -231,6 +231,42 @@ def test_build_pair_decisions_records_every_talking_frame() -> None:
     assert result.decisions[1]["status"] == "retained"
 
 
+def test_post_crop_mismatch_report_counts_stable_and_mouth_failures() -> None:
+    from dataclasses import replace
+
+    from edge_lipsync.silent_talking_dataset import build_pair_decisions, quality_report
+
+    stable_landmarks = dict(_builder_landmarks())
+    x, y = stable_landmarks[1]
+    stable_landmarks[1] = (x + 20.0, y)
+    mouth_landmarks = dict(_builder_landmarks())
+    for index in (61, 291):
+        x, y = mouth_landmarks[index]
+        mouth_landmarks[index] = (x + 20.0, y)
+
+    result = build_pair_decisions(
+        talking_observations=[_valid_observation(1)],
+        silent_observations=[
+            replace(_valid_observation(7), landmarks=stable_landmarks),
+            replace(_valid_observation(8), landmarks=mouth_landmarks),
+        ],
+        bnf_windows=np.zeros((1, 20, 256), dtype=np.float32),
+        audio_rms=np.ones(1, dtype=np.float32),
+        config=_test_config(),
+        split_for_frame=lambda _frame_idx: "train",
+    )
+    report = quality_report(
+        clip_id="talk",
+        talking_observations=[_valid_observation(1)],
+        decisions=result.decisions,
+        rows=result.rows,
+    )
+
+    assert result.decisions[0]["reject_reason"] == "post_crop_alignment_mismatch"
+    assert report["post_crop_alignment_mismatch_stable_landmark"] == 1
+    assert report["post_crop_alignment_mismatch_mouth_center"] == 1
+
+
 def _complete_row(split: str) -> dict[str, object]:
     image = np.full((168, 168, 3), 120, dtype=np.uint8)
     ok, encoded = cv2.imencode(".png", image)

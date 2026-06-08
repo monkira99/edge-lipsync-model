@@ -118,6 +118,13 @@ class MatchResult:
     alignment: AlignmentMetrics
 
 
+class PostCropAlignmentMismatch(ValueError):
+    def __init__(self, *, stable_landmark_failures: int, mouth_center_failures: int) -> None:
+        super().__init__("post_crop_alignment_mismatch")
+        self.stable_landmark_failures = stable_landmark_failures
+        self.mouth_center_failures = mouth_center_failures
+
+
 def normalized_bbox_geometry(
     bbox: BBox,
     frame_shape: tuple[int, ...],
@@ -525,6 +532,8 @@ def match_silent_observation(
     if not pose_geometry_candidates:
         raise ValueError("pose_geometry_no_match")
 
+    stable_landmark_failures = 0
+    mouth_center_failures = 0
     scored: list[
         tuple[float, FrameObservation, HeadPose, float, float, float, float, AlignmentMetrics]
     ] = []
@@ -538,10 +547,11 @@ def match_silent_observation(
             target.landmarks,
             target.bbox_xyxy,
         )
-        if (
-            alignment.stable_landmark_rmse > config.max_stable_landmark_rmse
-            or alignment.mouth_center_delta > config.max_mouth_center_delta
-        ):
+        stable_failed = alignment.stable_landmark_rmse > config.max_stable_landmark_rmse
+        mouth_failed = alignment.mouth_center_delta > config.max_mouth_center_delta
+        if stable_failed or mouth_failed:
+            stable_landmark_failures += int(stable_failed)
+            mouth_center_failures += int(mouth_failed)
             continue
         score = _match_score(
             pose_delta,
@@ -564,7 +574,10 @@ def match_silent_observation(
             )
         )
     if not scored:
-        raise ValueError("post_crop_alignment_mismatch")
+        raise PostCropAlignmentMismatch(
+            stable_landmark_failures=stable_landmark_failures,
+            mouth_center_failures=mouth_center_failures,
+        )
 
     scored.sort(key=lambda item: (item[0], item[1].frame_idx))
     best = scored[0]

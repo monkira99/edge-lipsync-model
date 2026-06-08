@@ -26,6 +26,7 @@ from edge_lipsync.pose_pairing import (
     FrameObservation,
     HeadPose,
     MatchConfig,
+    PostCropAlignmentMismatch,
     SyncWindow,
     assign_sync_windows,
     assign_video_splits,
@@ -493,6 +494,8 @@ def _base_decision(
         "matching_score": None,
         "stable_landmark_alignment_rmse": None,
         "mouth_center_delta_after_crop": None,
+        "post_crop_alignment_mismatch_stable_landmark": 0,
+        "post_crop_alignment_mismatch_mouth_center": 0,
     }
 
 
@@ -605,6 +608,13 @@ def build_pair_decisions(
         try:
             match = match_silent_observation(observation, valid_silent, config.match)
         except ValueError as exc:
+            if isinstance(exc, PostCropAlignmentMismatch):
+                decision["post_crop_alignment_mismatch_stable_landmark"] = (
+                    int(exc.stable_landmark_failures > 0)
+                )
+                decision["post_crop_alignment_mismatch_mouth_center"] = (
+                    int(exc.mouth_center_failures > 0)
+                )
             _reject(decision, str(exc))
             continue
 
@@ -859,13 +869,11 @@ def quality_report(
         if decision.get("reject_reason")
     )
     stable_mismatch = sum(
-        decision.get("reject_reason") == "post_crop_alignment_mismatch"
-        and decision.get("stable_landmark_alignment_rmse") is not None
+        int(decision.get("post_crop_alignment_mismatch_stable_landmark") or 0)
         for decision in decisions
     )
     mouth_mismatch = sum(
-        decision.get("reject_reason") == "post_crop_alignment_mismatch"
-        and decision.get("mouth_center_delta_after_crop") is not None
+        int(decision.get("post_crop_alignment_mismatch_mouth_center") or 0)
         for decision in decisions
     )
     retained = [row for row in rows if row["talking_clip_id"] == clip_id]
