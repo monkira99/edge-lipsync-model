@@ -48,6 +48,16 @@ def _normalize_rgb(rgb: np.ndarray) -> np.ndarray:
     return ((rgb.astype(np.float32) - 127.5) / 127.5).astype(np.float32)
 
 
+def _validate_roi_168(value: np.ndarray, field: str) -> np.ndarray:
+    if value.shape != (ROI_SOURCE_SIZE, ROI_SOURCE_SIZE, 3):
+        raise ValueError(
+            f"{field} must be BGR [{ROI_SOURCE_SIZE},{ROI_SOURCE_SIZE},3], got {value.shape}"
+        )
+    if value.dtype != np.uint8:
+        raise ValueError(f"{field} must use uint8 pixels, got {value.dtype}")
+    return value
+
+
 def validate_bbox(bbox: Sequence[int], frame_shape: tuple[int, ...]) -> BBox:
     if len(bbox) != 4:
         raise ValueError(f"Invalid bbox length: {bbox}")
@@ -141,11 +151,30 @@ def make_face_training_sample(
         raise ValueError(f"Invalid bbox produced empty ROI: {bbox}")
 
     roi_168_bgr = cv2.resize(roi, (ROI_SOURCE_SIZE, ROI_SOURCE_SIZE), interpolation=cv2.INTER_AREA)
-    real_patch_bgr = roi_168_bgr[
+    return make_face_training_sample_from_rois(
+        roi_168_bgr,
+        roi_168_bgr,
+        source_bbox_xyxy=bbox,
+    )
+
+
+def make_face_training_sample_from_rois(
+    source_roi_168_bgr: np.ndarray,
+    target_roi_168_bgr: np.ndarray,
+    *,
+    source_bbox_xyxy: BBox = (0, 0, ROI_SOURCE_SIZE, ROI_SOURCE_SIZE),
+) -> FaceTrainingSample:
+    source_roi = _validate_roi_168(source_roi_168_bgr, "source_roi_168_bgr")
+    target_roi = _validate_roi_168(target_roi_168_bgr, "target_roi_168_bgr")
+    source_patch = source_roi[
         ROI_EDGE : ROI_EDGE + FACE_SIZE,
         ROI_EDGE : ROI_EDGE + FACE_SIZE,
     ].copy()
-    masked_patch_bgr = real_patch_bgr.copy()
+    target_patch = target_roi[
+        ROI_EDGE : ROI_EDGE + FACE_SIZE,
+        ROI_EDGE : ROI_EDGE + FACE_SIZE,
+    ].copy()
+    masked_patch_bgr = source_patch.copy()
     cv2.rectangle(
         masked_patch_bgr,
         (MASK_X, MASK_Y),
@@ -154,18 +183,20 @@ def make_face_training_sample(
         -1,
     )
 
-    target_rgb = cv2.cvtColor(real_patch_bgr, cv2.COLOR_BGR2RGB)
+    source_rgb = cv2.cvtColor(source_patch, cv2.COLOR_BGR2RGB)
     masked_rgb = cv2.cvtColor(masked_patch_bgr, cv2.COLOR_BGR2RGB)
-    target_norm = _normalize_rgb(target_rgb)
+    target_rgb = cv2.cvtColor(target_patch, cv2.COLOR_BGR2RGB)
+    source_norm = _normalize_rgb(source_rgb)
     masked_norm = _normalize_rgb(masked_rgb)
+    target_norm = _normalize_rgb(target_rgb)
 
-    face = np.concatenate([target_norm, masked_norm], axis=2).transpose(2, 0, 1)
+    face = np.concatenate([source_norm, masked_norm], axis=2).transpose(2, 0, 1)
     target = target_norm.transpose(2, 0, 1)
     return FaceTrainingSample(
         face=np.ascontiguousarray(face.astype(np.float32)),
         target=np.ascontiguousarray(target.astype(np.float32)),
-        roi_168_bgr=roi_168_bgr,
-        real_patch_bgr=real_patch_bgr,
+        roi_168_bgr=source_roi.copy(),
+        real_patch_bgr=source_patch,
         masked_patch_bgr=masked_patch_bgr,
-        bbox_xyxy=bbox,
+        bbox_xyxy=source_bbox_xyxy,
     )

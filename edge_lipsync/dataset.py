@@ -13,7 +13,9 @@ from torch.utils.data import Dataset
 from torch.utils.data import Dataset as TorchDataset
 
 from edge_lipsync.audio_features import get_bnf_window
-from edge_lipsync.preprocess import make_face_training_sample
+from edge_lipsync.preprocess import make_face_training_sample, make_face_training_sample_from_rois
+
+SILENT_TALKING_SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v1"
 
 
 def _require_relative_path(value: object, field: str) -> str:
@@ -144,6 +146,60 @@ def _hf_frame_to_bgr(frame: Any) -> np.ndarray:
     raise TypeError(f"Unsupported Hugging Face frame value: {type(frame)!r}")
 
 
+def _silent_talking_hf_sample(row: dict[str, Any]) -> dict[str, Any]:
+    source_roi = _hf_frame_to_bgr(row["source_roi"])
+    target_roi = _hf_frame_to_bgr(row["target_roi"])
+    audio = np.asarray(row["audio"], dtype=np.float32)
+    if audio.shape != (20, 256):
+        raise ValueError(f"Invalid audio shape={audio.shape}, expected=(20, 256)")
+    sample = make_face_training_sample_from_rois(source_roi, target_roi)
+    meta = {
+        "schema_version": SILENT_TALKING_SCHEMA_VERSION,
+        "persona_id": str(row["persona_id"]),
+        "pair_id": str(row["pair_id"]),
+        "clip_id": str(row["talking_clip_id"]),
+        "talking_clip_id": str(row["talking_clip_id"]),
+        "source_frame_idx": int(row["source_frame_idx"]),
+        "target_frame_idx": int(row["target_frame_idx"]),
+        "frame_idx": int(row["target_frame_idx"]),
+        "audio_idx": int(row["audio_idx"]),
+        "source_bbox_xyxy": tuple(int(v) for v in row["source_bbox_xyxy"]),
+        "target_bbox_xyxy": tuple(int(v) for v in row["target_bbox_xyxy"]),
+        "sample_weight": float(row["sample_weight"]),
+        "flags": tuple(str(value) for value in row.get("flags", [])),
+    }
+    for key in (
+        "is_idle",
+        "sync_best_lag_frames",
+        "sync_correlation",
+        "sync_confidence",
+        "pose_delta_yaw",
+        "pose_delta_pitch",
+        "pose_delta_roll",
+        "center_delta_x",
+        "center_delta_y",
+        "width_ratio",
+        "height_ratio",
+        "stable_landmark_alignment_rmse",
+        "mouth_center_delta_after_crop",
+        "matching_score",
+        "valid_silent_candidate_count",
+        "second_best_matching_score",
+        "matching_score_margin",
+        "source_face_blur",
+        "target_face_blur",
+        "target_mouth_blur",
+    ):
+        if key in row:
+            meta[key] = row[key]
+    return {
+        "face": torch.from_numpy(sample.face),
+        "audio": torch.from_numpy(audio),
+        "target": torch.from_numpy(sample.target),
+        "meta": meta,
+    }
+
+
 class DuixHFDataset(TorchDataset[dict[str, Any]]):
     def __init__(self, dataset: Any, split: str) -> None:
         if hasattr(dataset, "keys") and split in dataset:
@@ -158,6 +214,8 @@ class DuixHFDataset(TorchDataset[dict[str, Any]]):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.dataset[index]
+        if row.get("schema_version") == SILENT_TALKING_SCHEMA_VERSION:
+            return _silent_talking_hf_sample(row)
         bbox = tuple(int(value) for value in row["bbox_xyxy"])
         if len(bbox) != 4:
             raise ValueError(f"bbox_xyxy must have 4 values: {bbox}")

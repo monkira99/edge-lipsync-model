@@ -42,6 +42,31 @@ def test_make_face_training_sample_uses_rgb_then_masked_rgb_channels() -> None:
     assert np.all(sample.face[3:, MASK_Y, MASK_X] == -1.0)
 
 
+def test_make_face_training_sample_from_roi_uses_distinct_source_and_target() -> None:
+    from edge_lipsync.preprocess import make_face_training_sample_from_rois
+
+    source = np.full((168, 168, 3), (10, 20, 30), dtype=np.uint8)
+    target = np.full((168, 168, 3), (200, 210, 220), dtype=np.uint8)
+
+    sample = make_face_training_sample_from_rois(source, target)
+
+    assert sample.face.shape == (6, 160, 160)
+    assert sample.target.shape == (3, 160, 160)
+    assert np.allclose(sample.face[0], (30.0 - 127.5) / 127.5)
+    assert np.allclose(sample.target[0], (220.0 - 127.5) / 127.5)
+    assert not np.array_equal(sample.face[:3], sample.target)
+
+
+def test_make_face_training_sample_from_rois_requires_168_square() -> None:
+    from edge_lipsync.preprocess import make_face_training_sample_from_rois
+
+    with pytest.raises(ValueError, match="168"):
+        make_face_training_sample_from_rois(
+            np.zeros((160, 160, 3), dtype=np.uint8),
+            np.zeros((168, 168, 3), dtype=np.uint8),
+        )
+
+
 def test_make_face_training_sample_rejects_invalid_bbox() -> None:
     from edge_lipsync.preprocess import make_face_training_sample
 
