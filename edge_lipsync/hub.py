@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -194,4 +196,99 @@ def pull_model_assets(
         resolved_ref=resolved,
         path=path,
         url=_repo_url(repo_id, repo_type="model", ref=resolved),
+    )
+
+
+def push_dataset_snapshot(
+    snapshot_root: str | Path,
+    repo_id: str,
+    *,
+    private: bool = True,
+    commit_message: str = "Upload pose-paired dataset snapshot",
+    api: Any | None = None,
+) -> HubArtifact:
+    root = Path(snapshot_root)
+    if not (root / "build_complete.json").is_file():
+        raise FileNotFoundError(root / "build_complete.json")
+    if not (root / "dataset/dataset_dict.json").is_file():
+        raise FileNotFoundError(root / "dataset/dataset_dict.json")
+    client = _client(api)
+    client.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
+    commit = client.upload_folder(
+        folder_path=str(root),
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+    )
+    ref = str(commit.oid)
+    return HubArtifact(
+        repo_id=repo_id,
+        requested_ref=ref,
+        resolved_ref=ref,
+        url=_repo_url(repo_id, repo_type="dataset", ref=ref),
+    )
+
+
+def pull_dataset_snapshot(
+    repo_id: str,
+    *,
+    ref: str,
+    local_dir: str,
+    cache_dir: str = "",
+    api: Any | None = None,
+    verify: Callable[[Path], dict[str, str]],
+) -> HubArtifact:
+    if not ref:
+        raise ValueError("Dataset snapshot revision is required")
+    root = Path(local_dir)
+    marker_path = root / ".snapshot_complete.json"
+    if marker_path.is_file():
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            fingerprints = verify(root)
+        except Exception:
+            marker = {}
+            fingerprints = {}
+        if (
+            marker.get("repo_id") == repo_id
+            and marker.get("resolved_ref") == ref
+            and marker.get("dataset_fingerprints") == fingerprints
+        ):
+            return HubArtifact(
+                repo_id=repo_id,
+                requested_ref=ref,
+                resolved_ref=ref,
+                path=root,
+                url=_repo_url(repo_id, repo_type="dataset", ref=ref),
+            )
+    kwargs: dict[str, Any] = {
+        "repo_id": repo_id,
+        "repo_type": "dataset",
+        "revision": ref,
+        "local_dir": str(root),
+    }
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+    downloaded = Path(snapshot_download(**kwargs))
+    info = _client(api).dataset_info(repo_id=repo_id, revision=ref)
+    resolved = str(info.sha)
+    if resolved != ref:
+        raise ValueError(f"Resolved dataset revision {resolved} does not match requested {ref}")
+    fingerprints = verify(downloaded)
+    marker = {
+        "repo_id": repo_id,
+        "requested_ref": ref,
+        "resolved_ref": resolved,
+        "dataset_fingerprints": fingerprints,
+    }
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+    temporary.replace(marker_path)
+    return HubArtifact(
+        repo_id=repo_id,
+        requested_ref=ref,
+        resolved_ref=resolved,
+        path=downloaded,
+        url=_repo_url(repo_id, repo_type="dataset", ref=resolved),
     )

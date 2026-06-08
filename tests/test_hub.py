@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,10 +21,15 @@ class _Info:
 
 
 class _FakeApi:
-    def __init__(self) -> None:
+    def __init__(self, *, dataset_sha: str = "dataset-sha") -> None:
         self.created: list[dict[str, Any]] = []
         self.uploads: list[dict[str, Any]] = []
         self.large_uploads: list[dict[str, Any]] = []
+        self.dataset_sha = dataset_sha
+
+    @property
+    def upload_calls(self) -> list[dict[str, Any]]:
+        return self.uploads
 
     def create_repo(self, **kwargs: Any) -> None:
         self.created.append(kwargs)
@@ -37,7 +43,7 @@ class _FakeApi:
         self.large_uploads.append(kwargs)
 
     def dataset_info(self, **_kwargs: Any) -> _Info:
-        return _Info("dataset-sha")
+        return _Info(self.dataset_sha)
 
     def model_info(self, **_kwargs: Any) -> _Info:
         return _Info("model-sha")
@@ -189,6 +195,51 @@ def test_pull_model_assets_downloads_snapshot_to_local_dir(
             "cache_dir": "/cache",
         }
     ]
+
+
+def test_push_dataset_snapshot_uploads_complete_package(tmp_path: Path) -> None:
+    from edge_lipsync.hub import push_dataset_snapshot
+
+    snapshot = tmp_path / "snapshot"
+    (snapshot / "dataset").mkdir(parents=True)
+    (snapshot / "dataset/dataset_dict.json").write_text("{}", encoding="utf-8")
+    (snapshot / "build_complete.json").write_text("{}", encoding="utf-8")
+    api = _FakeApi()
+
+    artifact = push_dataset_snapshot(snapshot, "owner/nora-pairs", api=api)
+
+    assert artifact.resolved_ref == "dataset-commit"
+    assert api.created[-1]["repo_type"] == "dataset"
+    assert api.upload_calls[-1]["repo_type"] == "dataset"
+
+
+def test_pull_dataset_snapshot_writes_verified_local_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.hub as hub
+
+    downloaded = tmp_path / "downloaded"
+    (downloaded / "dataset/train").mkdir(parents=True)
+    (downloaded / "dataset/val").mkdir(parents=True)
+    (downloaded / "build_complete.json").write_text(
+        json.dumps({"dataset_fingerprints": {"train": "a", "val": "b"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hub, "snapshot_download", lambda **_kwargs: str(downloaded))
+
+    artifact = hub.pull_dataset_snapshot(
+        "owner/nora-pairs",
+        ref="full-sha",
+        local_dir=str(downloaded),
+        api=_FakeApi(dataset_sha="full-sha"),
+        verify=lambda _path: {"train": "a", "val": "b"},
+    )
+
+    marker = json.loads((downloaded / ".snapshot_complete.json").read_text())
+    assert artifact.path == downloaded
+    assert marker["repo_id"] == "owner/nora-pairs"
+    assert marker["resolved_ref"] == "full-sha"
 
 
 @pytest.mark.parametrize(
