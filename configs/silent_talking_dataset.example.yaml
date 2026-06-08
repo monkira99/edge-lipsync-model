@@ -1,0 +1,43 @@
+data_root: /absolute/path/to/data
+persona_id: nora
+snapshot_root: /absolute/path/to/datasets/nora_pose_pairs
+work_root: /absolute/path/to/work/nora_pose_pairs
+wenet_onnx: /absolute/path/to/models/wenet/wenet.onnx
+landmark_model_asset_path: /absolute/path/to/models/mediapipe/face_landmarker.task
+fps: 25
+sample_rate: 16000
+validation_fraction: 0.2
+split_salt: edge-lipsync-silent-talking-v1
+idle_max_ratio: 0.1
+idle_sample_weight: 0.25
+preview_count_per_group: 8
+progress: true
+strict: false
+matching:
+  max_yaw_delta: 5.0
+  max_pitch_delta: 5.0
+  max_roll_delta: 4.0
+  max_center_x_delta: 0.05
+  max_center_y_delta: 0.05
+  min_width_ratio: 0.9
+  max_width_ratio: 1.1
+  min_height_ratio: 0.9
+  max_height_ratio: 1.1
+  pose_weight: 1.0
+  position_weight: 1.0
+  scale_weight: 1.0
+post_crop_alignment:
+  max_stable_landmark_rmse: 0.04
+  max_mouth_center_delta: 0.04
+blur:
+  min_source_face_laplacian_variance: 60.0
+  min_target_face_laplacian_variance: 60.0
+  min_target_mouth_laplacian_variance: 40.0
+sync:
+  window_seconds: 2.0
+  stride_seconds: 1.0
+  max_lag_frames: 3
+  max_reject_lag_frames: 2
+  min_correlation: 0.2
+  silence_rms_threshold: 0.001
+  speech_fraction_threshold: 0.25
