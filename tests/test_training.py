@@ -147,6 +147,8 @@ def test_run_validation_reports_image_mouth_temporal_and_audio_metrics() -> None
         batches,
         torch.device("cpu"),
         lpips_evaluator=MeanDistance(),
+        lpips_face_loss_weight=0.01,
+        lpips_mouth_loss_weight=0.05,
     )
     with torch.no_grad():
         expected_val_loss = sum(
@@ -159,7 +161,8 @@ def test_run_validation_reports_image_mouth_temporal_and_audio_metrics() -> None
             for batch in batches
         ) / len(batches)
 
-    assert metrics["val_loss"] == pytest.approx(expected_val_loss)
+    expected_lpips_loss = 0.01 * metrics["val_lpips_face"] + 0.05 * metrics["val_lpips_mouth"]
+    assert metrics["val_loss"] == pytest.approx(expected_val_loss + expected_lpips_loss)
     assert metrics["val_reconstruction_loss"] > 0
     assert metrics["val_mouth_loss"] > 0
     assert metrics["val_temporal_delta"] > 0

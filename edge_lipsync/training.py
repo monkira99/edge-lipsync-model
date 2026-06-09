@@ -18,6 +18,7 @@ from edge_lipsync.hub import HubArtifact, pull_dataset_snapshot, push_model_arti
 from edge_lipsync.losses import (
     charbonnier_loss,
     combined_reconstruction_loss,
+    combined_training_loss,
     mouth_weighted_l1,
 )
 from edge_lipsync.metrics import (
@@ -61,6 +62,8 @@ class TrainConfig:
     log_interval: int = 10
     lpips_enabled: bool = False
     lpips_net: str = "alex"
+    lpips_face_loss_weight: float = 0.0
+    lpips_mouth_loss_weight: float = 0.0
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
     media_eval_on_best: bool = True
@@ -198,7 +201,13 @@ def run_validation(
     *,
     mixed_precision: bool = False,
     lpips_evaluator: torch.nn.Module | None = None,
+    lpips_face_loss_weight: float = 0.0,
+    lpips_mouth_loss_weight: float = 0.0,
 ) -> dict[str, float]:
+    if lpips_face_loss_weight < 0 or lpips_mouth_loss_weight < 0:
+        raise ValueError("LPIPS loss weights must be non-negative")
+    if (lpips_face_loss_weight > 0 or lpips_mouth_loss_weight > 0) and lpips_evaluator is None:
+        raise ValueError("LPIPS evaluator is required when LPIPS loss weights are positive")
     model.eval()
     reconstruction: list[float] = []
     total: list[float] = []
@@ -223,7 +232,7 @@ def run_validation(
         with torch.autocast(device_type=device.type, enabled=mixed_precision):
             pred = model(face, audio)
             shifted_pred = model(face, shift_audio_window(audio))
-            total.append(float(combined_reconstruction_loss(pred, target).cpu()))
+            reconstruction_total = combined_reconstruction_loss(pred, target)
             reconstruction.append(float(charbonnier_loss(pred, target).cpu()))
             mouth.append(float(mouth_weighted_l1(pred, target).cpu()))
         mae.extend(image_mae(pred, target).cpu().tolist())
@@ -238,6 +247,19 @@ def run_validation(
             face_lpips, mouth_lpips = lpips_face_and_mouth(lpips_evaluator, pred, target)
             lpips_face_values.extend(face_lpips.cpu().tolist())
             lpips_mouth_values.extend(mouth_lpips.cpu().tolist())
+            total.append(
+                float(
+                    (
+                        reconstruction_total
+                        + lpips_face_loss_weight * face_lpips.mean()
+                        + lpips_mouth_loss_weight * mouth_lpips.mean()
+                    )
+                    .detach()
+                    .cpu()
+                )
+            )
+        else:
+            total.append(float(reconstruction_total.cpu()))
         audio_sensitivity.extend(mouth_mae(pred, shifted_pred).cpu().tolist())
         audio_shift_mouth_mae_delta.extend((shifted_mouth_mae - current_mouth_mae).cpu().tolist())
         metadata = batch.get("meta", [])
@@ -732,6 +754,8 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("log_interval must be >= 0")
     if config.lpips_net not in {"alex", "vgg", "squeeze"}:
         raise ValueError(f"Unsupported lpips_net={config.lpips_net!r}")
+    if config.lpips_face_loss_weight < 0 or config.lpips_mouth_loss_weight < 0:
+        raise ValueError("LPIPS loss weights must be non-negative")
     if config.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be >= 0")
     if config.early_stopping_min_delta < 0:
@@ -755,7 +779,13 @@ def train(config: TrainConfig) -> Path:
     manifest_path = prepared_data.manifest_path
     device = resolve_device(config.device)
     model, init_weight_source = build_model(config, device)
-    lpips_evaluator = LPIPSEvaluator(device, net=config.lpips_net) if config.lpips_enabled else None
+    lpips_evaluator = (
+        LPIPSEvaluator(device, net=config.lpips_net)
+        if config.lpips_enabled
+        or config.lpips_face_loss_weight > 0
+        or config.lpips_mouth_loss_weight > 0
+        else None
+    )
     provenance = {
         "dataset": prepared_data.provenance,
         "init_model": init_weight_source,
@@ -798,6 +828,15 @@ def train(config: TrainConfig) -> Path:
         )
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
 
+        def training_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return combined_training_loss(
+                pred,
+                target,
+                lpips_evaluator=lpips_evaluator,
+                lpips_face_weight=config.lpips_face_loss_weight,
+                lpips_mouth_weight=config.lpips_mouth_loss_weight,
+            )
+
         metrics: list[dict[str, float | int | str]] = []
         media_eval_artifacts: list[dict[str, Any]] = []
         best_val_loss = float("inf")
@@ -837,7 +876,7 @@ def train(config: TrainConfig) -> Path:
                     batch=batch,
                     optimizer=optimizer,
                     device=device,
-                    loss_fn=combined_reconstruction_loss,
+                    loss_fn=training_loss,
                     mixed_precision=mixed_precision,
                     scaler=scaler,
                 )
@@ -857,6 +896,8 @@ def train(config: TrainConfig) -> Path:
                         device,
                         mixed_precision=mixed_precision,
                         lpips_evaluator=lpips_evaluator,
+                        lpips_face_loss_weight=config.lpips_face_loss_weight,
+                        lpips_mouth_loss_weight=config.lpips_mouth_loss_weight,
                     )
                     row.update(validation)
                     val_loss = float(validation["val_loss"])

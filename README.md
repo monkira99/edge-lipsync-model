@@ -277,8 +277,8 @@ Training writes atomic checkpoints, `best.pt`, `final.pt`, `metrics.json`, `metr
 config, step, epoch, metrics, initialization source, dataset provenance, and W&B run provenance.
 The train loop also prints concise progress rows to stdout every `log_interval` steps and whenever
 validation runs, which is useful in Colab notebooks. Validation rows include `val_loss`, the same
-combined reconstruction objective used for training, plus reconstruction, mouth, and temporal
-metrics. `best.pt` is selected by `val_loss`.
+configured reconstruction-plus-perceptual objective used for training, plus reconstruction, mouth,
+and temporal metrics. `best.pt` is selected by `val_loss`.
 
 Additional validation metrics cover three failure modes that reconstruction loss alone misses:
 
@@ -303,6 +303,21 @@ Set `lpips_enabled: true` to compute face and mouth LPIPS. `lpips_net` supports 
 233 MB of pretrained weights into the PyTorch cache. LPIPS is disabled by the dataclass default so
 existing or offline runs do not download weights unexpectedly, while the example train and eval
 configs enable it explicitly.
+
+LPIPS can also participate in the training objective:
+
+```text
+train_loss = combined_reconstruction_loss
+           + lpips_face_loss_weight * face_lpips
+           + lpips_mouth_loss_weight * mouth_lpips
+```
+
+The example train config uses `lpips_face_loss_weight: 0.01` and
+`lpips_mouth_loss_weight: 0.05`, prioritizing perceptual quality in the mouth crop. Set both weights
+to `0` to recover the previous reconstruction-only objective. Positive weights automatically load
+the frozen LPIPS evaluator even when `lpips_enabled` is false. Gradients pass through LPIPS to the
+Duix prediction, but LPIPS parameters remain frozen. `alex` is the practical low-cost default;
+`vgg` is more expensive but is the LPIPS authors' recommended backbone for optimization.
 
 Early stopping is disabled by default. Set `early_stopping_patience` to the number of validation
 runs allowed without a `val_loss` improvement, and optionally set `early_stopping_min_delta` for the
