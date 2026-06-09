@@ -20,6 +20,18 @@ from edge_lipsync.losses import (
     combined_reconstruction_loss,
     mouth_weighted_l1,
 )
+from edge_lipsync.metrics import (
+    LPIPSEvaluator,
+    image_mae,
+    image_psnr,
+    image_ssim,
+    lpips_face_and_mouth,
+    mouth_mae,
+    mouth_psnr,
+    mouth_ssim,
+    mouth_temporal_error,
+    shift_audio_window,
+)
 from edge_lipsync.model import DuixUNet, load_ckpt
 from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
 from edge_lipsync.tracking import WandbConfig, create_tracker
@@ -47,6 +59,8 @@ class TrainConfig:
     validation_interval: int = 100
     checkpoint_interval: int = 100
     log_interval: int = 10
+    lpips_enabled: bool = False
+    lpips_net: str = "alex"
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
     media_eval_on_best: bool = True
@@ -183,34 +197,102 @@ def run_validation(
     device: torch.device,
     *,
     mixed_precision: bool = False,
+    lpips_evaluator: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     model.eval()
     reconstruction: list[float] = []
     total: list[float] = []
     mouth: list[float] = []
     temporal: list[float] = []
-    previous_pred: torch.Tensor | None = None
+    mae: list[float] = []
+    psnr: list[float] = []
+    ssim: list[float] = []
+    mouth_mae_values: list[float] = []
+    mouth_psnr_values: list[float] = []
+    mouth_ssim_values: list[float] = []
+    lpips_face_values: list[float] = []
+    lpips_mouth_values: list[float] = []
+    mouth_temporal: list[float] = []
+    audio_sensitivity: list[float] = []
+    audio_shift_mouth_mae_delta: list[float] = []
+    previous_by_clip: dict[str, tuple[int, torch.Tensor, torch.Tensor]] = {}
     for batch in loader:
         face = batch["face"].to(device=device, dtype=torch.float32)
         audio = batch["audio"].to(device=device, dtype=torch.float32)
         target = batch["target"].to(device=device, dtype=torch.float32)
         with torch.autocast(device_type=device.type, enabled=mixed_precision):
             pred = model(face, audio)
+            shifted_pred = model(face, shift_audio_window(audio))
             total.append(float(combined_reconstruction_loss(pred, target).cpu()))
             reconstruction.append(float(charbonnier_loss(pred, target).cpu()))
             mouth.append(float(mouth_weighted_l1(pred, target).cpu()))
-        for current_pred in pred:
-            if previous_pred is not None:
-                temporal.append(float(torch.mean(torch.abs(current_pred - previous_pred)).cpu()))
-            previous_pred = current_pred
+        mae.extend(image_mae(pred, target).cpu().tolist())
+        psnr.extend(image_psnr(pred, target).cpu().tolist())
+        ssim.extend(image_ssim(pred, target).cpu().tolist())
+        current_mouth_mae = mouth_mae(pred, target)
+        shifted_mouth_mae = mouth_mae(shifted_pred, target)
+        mouth_mae_values.extend(current_mouth_mae.cpu().tolist())
+        mouth_psnr_values.extend(mouth_psnr(pred, target).cpu().tolist())
+        mouth_ssim_values.extend(mouth_ssim(pred, target).cpu().tolist())
+        if lpips_evaluator is not None:
+            face_lpips, mouth_lpips = lpips_face_and_mouth(lpips_evaluator, pred, target)
+            lpips_face_values.extend(face_lpips.cpu().tolist())
+            lpips_mouth_values.extend(mouth_lpips.cpu().tolist())
+        audio_sensitivity.extend(mouth_mae(pred, shifted_pred).cpu().tolist())
+        audio_shift_mouth_mae_delta.extend((shifted_mouth_mae - current_mouth_mae).cpu().tolist())
+        metadata = batch.get("meta", [])
+        if isinstance(metadata, list):
+            for index, meta in enumerate(metadata):
+                if not isinstance(meta, dict) or "clip_id" not in meta or "frame_idx" not in meta:
+                    continue
+                clip_id = str(meta["clip_id"])
+                frame_idx = int(meta["frame_idx"])
+                previous = previous_by_clip.get(clip_id)
+                current_pred = pred[index : index + 1]
+                current_target = target[index : index + 1]
+                if previous is not None and frame_idx == previous[0] + 1:
+                    temporal.append(float(torch.mean(torch.abs(current_pred - previous[1])).cpu()))
+                    mouth_temporal.extend(
+                        mouth_temporal_error(
+                            current_pred,
+                            current_target,
+                            previous[1],
+                            previous[2],
+                        )
+                        .cpu()
+                        .tolist()
+                    )
+                previous_by_clip[clip_id] = (
+                    frame_idx,
+                    current_pred.detach(),
+                    current_target.detach(),
+                )
     if not reconstruction:
         raise ValueError("Validation loader produced no batches")
-    return {
+    metrics = {
         "val_loss": sum(total) / len(total),
         "val_reconstruction_loss": sum(reconstruction) / len(reconstruction),
         "val_mouth_loss": sum(mouth) / len(mouth),
         "val_temporal_delta": sum(temporal) / len(temporal) if temporal else 0.0,
+        "val_mae": sum(mae) / len(mae),
+        "val_psnr": sum(psnr) / len(psnr),
+        "val_ssim": sum(ssim) / len(ssim),
+        "val_mouth_mae": sum(mouth_mae_values) / len(mouth_mae_values),
+        "val_mouth_psnr": sum(mouth_psnr_values) / len(mouth_psnr_values),
+        "val_mouth_ssim": sum(mouth_ssim_values) / len(mouth_ssim_values),
+        "val_mouth_temporal_error": (
+            sum(mouth_temporal) / len(mouth_temporal) if mouth_temporal else 0.0
+        ),
+        "val_temporal_pair_count": float(len(mouth_temporal)),
+        "val_audio_sensitivity": sum(audio_sensitivity) / len(audio_sensitivity),
+        "val_audio_shift_mouth_mae_delta": (
+            sum(audio_shift_mouth_mae_delta) / len(audio_shift_mouth_mae_delta)
+        ),
     }
+    if lpips_face_values:
+        metrics["val_lpips_face"] = sum(lpips_face_values) / len(lpips_face_values)
+        metrics["val_lpips_mouth"] = sum(lpips_mouth_values) / len(lpips_mouth_values)
+    return metrics
 
 
 def phase_for_step(
@@ -287,7 +369,15 @@ def _format_training_log(row: dict[str, float | int | str], *, max_steps: int) -
         f"lr={float(row['learning_rate']):.3g}",
         f"train_loss={float(row['train_loss']):.6g}",
     ]
-    for key in ("val_loss", "val_reconstruction_loss", "val_mouth_loss", "val_temporal_delta"):
+    for key in (
+        "val_loss",
+        "val_reconstruction_loss",
+        "val_mouth_loss",
+        "val_mouth_mae",
+        "val_lpips_mouth",
+        "val_mouth_temporal_error",
+        "val_audio_shift_mouth_mae_delta",
+    ):
         if key in row:
             parts.append(f"{key}={float(row[key]):.6g}")
     return " ".join(parts)
@@ -484,6 +574,7 @@ def _render_best_media_eval(
     fps: float,
     tracker: Any,
     log_to_wandb: bool,
+    lpips_evaluator: torch.nn.Module | None = None,
 ) -> dict[str, Any]:
     out_dir = run_dir / "media_eval" / f"step_{step:07d}_best"
     artifacts = render_validation_artifacts(
@@ -494,6 +585,7 @@ def _render_best_media_eval(
         device=device,
         max_batches=len(selection.indices),
         fps=fps,
+        lpips_evaluator=lpips_evaluator,
     )
     metadata_path = Path(str(artifacts["metadata_path"]))
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -638,6 +730,8 @@ def train(config: TrainConfig) -> Path:
         raise ValueError("validation_interval and checkpoint_interval must be positive")
     if config.log_interval < 0:
         raise ValueError("log_interval must be >= 0")
+    if config.lpips_net not in {"alex", "vgg", "squeeze"}:
+        raise ValueError(f"Unsupported lpips_net={config.lpips_net!r}")
     if config.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be >= 0")
     if config.early_stopping_min_delta < 0:
@@ -661,6 +755,7 @@ def train(config: TrainConfig) -> Path:
     manifest_path = prepared_data.manifest_path
     device = resolve_device(config.device)
     model, init_weight_source = build_model(config, device)
+    lpips_evaluator = LPIPSEvaluator(device, net=config.lpips_net) if config.lpips_enabled else None
     provenance = {
         "dataset": prepared_data.provenance,
         "init_model": init_weight_source,
@@ -761,13 +856,13 @@ def train(config: TrainConfig) -> Path:
                         val_loader,
                         device,
                         mixed_precision=mixed_precision,
+                        lpips_evaluator=lpips_evaluator,
                     )
                     row.update(validation)
                     val_loss = float(validation["val_loss"])
                     checkpoint_improved = val_loss < best_val_loss
                     early_stopping_improved = (
-                        val_loss
-                        < early_stopping_best_val_loss - config.early_stopping_min_delta
+                        val_loss < early_stopping_best_val_loss - config.early_stopping_min_delta
                     )
                     if checkpoint_improved:
                         best_val_loss = val_loss
@@ -785,9 +880,7 @@ def train(config: TrainConfig) -> Path:
                             early_stop_step = step
                             row["early_stop_reason"] = early_stop_reason
                             row["early_stop_patience"] = config.early_stopping_patience
-                            row["early_stop_bad_validation_count"] = (
-                                validations_without_improvement
-                            )
+                            row["early_stop_bad_validation_count"] = validations_without_improvement
                             row["best_val_loss"] = best_val_loss
                     tracker.log_metrics(row, step=step)
                     row_logged = True
@@ -834,6 +927,7 @@ def train(config: TrainConfig) -> Path:
                                     fps=config.media_eval_fps,
                                     tracker=tracker,
                                     log_to_wandb=config.media_eval_log_to_wandb,
+                                    lpips_evaluator=lpips_evaluator,
                                 )
                             )
                             print(
@@ -929,6 +1023,10 @@ def train(config: TrainConfig) -> Path:
                 summary["best_val_reconstruction_loss"] = float(
                     best_metrics["val_reconstruction_loss"]
                 )
+            if "val_lpips_face" in best_metrics:
+                summary["best_val_lpips_face"] = float(best_metrics["val_lpips_face"])
+            if "val_lpips_mouth" in best_metrics:
+                summary["best_val_lpips_mouth"] = float(best_metrics["val_lpips_mouth"])
         if early_stop_reason:
             summary["early_stop_reason"] = early_stop_reason
             summary["early_stop_step"] = early_stop_step

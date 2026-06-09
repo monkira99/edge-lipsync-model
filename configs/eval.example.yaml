@@ -5,6 +5,8 @@ out_dir: /absolute/path/to/runs/avatar_name/eval
 max_batches: 32
 device: cpu
 fps: 25.0
+lpips_enabled: true
+lpips_net: alex
 hf_dataset_repo: ""
 hf_model_repo: ""
 hf_model_filename: best.pt

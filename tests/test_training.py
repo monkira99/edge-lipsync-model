@@ -108,25 +108,46 @@ def test_collate_training_batch_keeps_variable_metadata_as_records() -> None:
     ]
 
 
-def test_run_validation_reports_total_reconstruction_mouth_and_temporal_metrics() -> None:
+def test_run_validation_reports_image_mouth_temporal_and_audio_metrics() -> None:
     from edge_lipsync.losses import combined_reconstruction_loss
     from edge_lipsync.training import run_validation
 
-    model = _FaceAudioModel()
+    class AudioAwareModel(torch.nn.Module):
+        def forward(self, face: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
+            value = audio[:, 0, 0].view(-1, 1, 1, 1)
+            return face[:, :3] + value
+
+    model = AudioAwareModel()
+    first_audio = torch.zeros(1, 20, 256)
+    first_audio[:, 5, :] = 0.5
+    second_audio = torch.zeros(1, 20, 256)
+    second_audio[:, 0, :] = 0.25
+    second_audio[:, 5, :] = 0.75
     batches = [
         {
             "face": torch.zeros(1, 6, 160, 160),
-            "audio": torch.zeros(1, 20, 256),
-            "target": torch.ones(1, 3, 160, 160),
+            "audio": first_audio,
+            "target": torch.zeros(1, 3, 160, 160),
+            "meta": [{"clip_id": "clip-a", "frame_idx": 1}],
         },
         {
             "face": torch.ones(1, 6, 160, 160),
-            "audio": torch.zeros(1, 20, 256),
+            "audio": second_audio,
             "target": torch.ones(1, 3, 160, 160),
+            "meta": [{"clip_id": "clip-a", "frame_idx": 2}],
         },
     ]
 
-    metrics = run_validation(model, batches, torch.device("cpu"))
+    class MeanDistance(torch.nn.Module):
+        def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return torch.mean(torch.abs(pred - target), dim=(1, 2, 3), keepdim=True)
+
+    metrics = run_validation(
+        model,
+        batches,
+        torch.device("cpu"),
+        lpips_evaluator=MeanDistance(),
+    )
     with torch.no_grad():
         expected_val_loss = sum(
             float(
@@ -142,6 +163,44 @@ def test_run_validation_reports_total_reconstruction_mouth_and_temporal_metrics(
     assert metrics["val_reconstruction_loss"] > 0
     assert metrics["val_mouth_loss"] > 0
     assert metrics["val_temporal_delta"] > 0
+    assert metrics["val_mae"] > 0
+    assert metrics["val_psnr"] > 0
+    assert -1.0 <= metrics["val_ssim"] <= 1.0
+    assert metrics["val_mouth_mae"] > 0
+    assert metrics["val_mouth_psnr"] > 0
+    assert -1.0 <= metrics["val_mouth_ssim"] <= 1.0
+    assert metrics["val_mouth_temporal_error"] > 0
+    assert metrics["val_temporal_pair_count"] == 1
+    assert metrics["val_audio_sensitivity"] > 0
+    assert metrics["val_audio_shift_mouth_mae_delta"] != 0
+    assert metrics["val_lpips_face"] > 0
+    assert metrics["val_lpips_mouth"] > 0
+
+
+def test_run_validation_does_not_compare_temporal_motion_across_clips() -> None:
+    from edge_lipsync.training import run_validation
+
+    model = _FaceAudioModel()
+    batches = [
+        {
+            "face": torch.zeros(1, 6, 160, 160),
+            "audio": torch.zeros(1, 20, 256),
+            "target": torch.zeros(1, 3, 160, 160),
+            "meta": [{"clip_id": "clip-a", "frame_idx": 1}],
+        },
+        {
+            "face": torch.ones(1, 6, 160, 160),
+            "audio": torch.zeros(1, 20, 256),
+            "target": torch.ones(1, 3, 160, 160),
+            "meta": [{"clip_id": "clip-b", "frame_idx": 1}],
+        },
+    ]
+
+    metrics = run_validation(model, batches, torch.device("cpu"))
+
+    assert metrics["val_temporal_delta"] == 0.0
+    assert metrics["val_mouth_temporal_error"] == 0.0
+    assert metrics["val_temporal_pair_count"] == 0
 
 
 def test_phase_for_step_covers_warmup_main_and_stabilization() -> None:

@@ -280,6 +280,30 @@ validation runs, which is useful in Colab notebooks. Validation rows include `va
 combined reconstruction objective used for training, plus reconstruction, mouth, and temporal
 metrics. `best.pt` is selected by `val_loss`.
 
+Additional validation metrics cover three failure modes that reconstruction loss alone misses:
+
+- `val_mae`, `val_psnr`, and `val_ssim` measure full-frame reconstruction quality.
+- `val_mouth_mae`, `val_mouth_psnr`, and `val_mouth_ssim` measure a fixed lower-face mouth ROI.
+- `val_lpips_face` and `val_lpips_mouth` measure learned perceptual distance with a frozen LPIPS
+  backbone. Lower values indicate closer perceptual similarity.
+- `val_mouth_temporal_error` compares predicted and target mouth motion for consecutive frames in
+  the same clip. `val_temporal_pair_count` reports how many valid frame pairs were measured.
+- `val_audio_sensitivity` measures how much the mouth prediction changes when the BNF window is
+  shifted by five frames. `val_audio_shift_mouth_mae_delta` measures shifted-audio mouth MAE minus
+  aligned-audio mouth MAE; positive values indicate that aligned audio produces the better result.
+
+Lower is better for MAE and temporal error; higher is better for PSNR and SSIM. Near-zero audio
+sensitivity suggests that the model may be ignoring audio, while a positive audio-shift MAE delta
+indicates that aligned audio produces the better reconstruction. Audio-shift metrics require one
+additional model forward pass during validation. They are diagnostics rather than the current
+checkpoint-selection objective.
+
+Set `lpips_enabled: true` to compute face and mouth LPIPS. `lpips_net` supports `alex`, `vgg`, and
+`squeeze`; `alex` is the default evaluation backbone. The first AlexNet run downloads approximately
+233 MB of pretrained weights into the PyTorch cache. LPIPS is disabled by the dataclass default so
+existing or offline runs do not download weights unexpectedly, while the example train and eval
+configs enable it explicitly.
+
 Early stopping is disabled by default. Set `early_stopping_patience` to the number of validation
 runs allowed without a `val_loss` improvement, and optionally set `early_stopping_min_delta` for the
 minimum improvement threshold.

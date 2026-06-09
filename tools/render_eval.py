@@ -17,6 +17,7 @@ from edge_lipsync.eval import (  # noqa: E402
     render_validation_artifacts,
     resolve_eval_inputs,
 )
+from edge_lipsync.metrics import LPIPSEvaluator  # noqa: E402
 from edge_lipsync.model import load_ckpt  # noqa: E402
 
 
@@ -39,6 +40,8 @@ def _load_config(args: argparse.Namespace) -> RenderEvalConfig:
         "hf_model_repo",
         "hf_model_filename",
         "hf_cache_dir",
+        "lpips_enabled",
+        "lpips_net",
     ):
         value = getattr(args, field)
         if value is not None:
@@ -62,19 +65,28 @@ def main() -> None:
     parser.add_argument("--hf-model-repo")
     parser.add_argument("--hf-model-filename")
     parser.add_argument("--hf-cache-dir")
+    parser.add_argument(
+        "--lpips-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--lpips-net", choices=("alex", "vgg", "squeeze"))
     args = parser.parse_args()
     config = _load_config(args)
     inputs = resolve_eval_inputs(config)
 
-    model = load_ckpt(inputs.checkpoint, map_location=config.device)
+    device = torch.device(config.device)
+    model = load_ckpt(inputs.checkpoint, map_location=device)
+    lpips_evaluator = LPIPSEvaluator(device, net=config.lpips_net) if config.lpips_enabled else None
     artifacts = render_validation_artifacts(
         model=model,
         dataset=inputs.dataset,
         out_dir=config.out_dir,
         checkpoint_path=inputs.checkpoint,
-        device=torch.device(config.device),
+        device=device,
         max_batches=config.max_batches,
         fps=config.fps,
+        lpips_evaluator=lpips_evaluator,
     )
     print(f"video={artifacts['video_path']}")
     print(f"metadata={artifacts['metadata_path']}")

@@ -89,6 +89,10 @@ def test_render_validation_artifacts_ignores_nullable_sample_metadata(tmp_path: 
         def forward(self, face: torch.Tensor, _audio: torch.Tensor) -> torch.Tensor:
             return face[:, :3]
 
+    class MeanDistance(torch.nn.Module):
+        def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            return torch.mean(torch.abs(pred - target), dim=(1, 2, 3), keepdim=True)
+
     artifacts = render_validation_artifacts(
         model=TinyModel(),
         dataset=NullableMetaDataset(),
@@ -96,9 +100,22 @@ def test_render_validation_artifacts_ignores_nullable_sample_metadata(tmp_path: 
         checkpoint_path=tmp_path / "best.pt",
         device=torch.device("cpu"),
         max_batches=1,
+        lpips_evaluator=MeanDistance(),
     )
 
     assert Path(str(artifacts["video_path"])).is_file()
+    assert {
+        "val_mae",
+        "val_psnr",
+        "val_ssim",
+        "val_mouth_mae",
+        "val_mouth_psnr",
+        "val_mouth_ssim",
+        "val_audio_sensitivity",
+        "val_audio_shift_mouth_mae_delta",
+        "val_lpips_face",
+        "val_lpips_mouth",
+    } <= artifacts["metrics"].keys()
 
 
 def test_render_eval_cli_help() -> None:
@@ -113,6 +130,8 @@ def test_render_eval_cli_help() -> None:
     assert "--config" in result.stdout
     assert "--hf-dataset-repo" in result.stdout
     assert "--hf-model-repo" in result.stdout
+    assert "--lpips-net" in result.stdout
+    assert "--no-lpips-enabled" in result.stdout
 
 
 def test_resolve_eval_inputs_uses_hf_dataset_without_revision(

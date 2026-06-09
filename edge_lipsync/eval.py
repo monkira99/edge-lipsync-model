@@ -13,6 +13,17 @@ from torch.utils.data import DataLoader, default_collate
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset
 from edge_lipsync.hf_datasets import load_processed_dataset
 from edge_lipsync.losses import charbonnier_loss, mouth_weighted_l1
+from edge_lipsync.metrics import (
+    image_mae,
+    image_psnr,
+    image_ssim,
+    lpips_face_and_mouth,
+    mouth_mae,
+    mouth_psnr,
+    mouth_ssim,
+    mouth_temporal_error,
+    shift_audio_window,
+)
 from edge_lipsync.sources import resolve_dataset_source, resolve_model_source
 
 
@@ -29,6 +40,8 @@ class RenderEvalConfig:
     hf_model_repo: str = ""
     hf_model_filename: str = "best.pt"
     hf_cache_dir: str = ""
+    lpips_enabled: bool = False
+    lpips_net: str = "alex"
 
 
 @dataclass(frozen=True)
@@ -99,9 +112,7 @@ def prediction_grid_rgb(
     masked = chw_norm_to_rgb_u8(masked_chw)
     pred = chw_norm_to_rgb_u8(pred_chw)
     target = chw_norm_to_rgb_u8(target_chw)
-    diff = np.clip(np.abs(pred.astype(np.int16) - target.astype(np.int16)), 0, 255).astype(
-        np.uint8
-    )
+    diff = np.clip(np.abs(pred.astype(np.int16) - target.astype(np.int16)), 0, 255).astype(np.uint8)
     return np.concatenate([masked, pred, target, diff], axis=1)
 
 
@@ -176,6 +187,7 @@ def render_validation_artifacts(
     device: torch.device,
     max_batches: int,
     fps: float = 25.0,
+    lpips_evaluator: torch.nn.Module | None = None,
 ) -> dict[str, Any]:
     if max_batches <= 0:
         raise ValueError("max_batches must be positive")
@@ -188,6 +200,19 @@ def render_validation_artifacts(
     grid_frames: list[np.ndarray] = []
     reconstruction: list[float] = []
     mouth: list[float] = []
+    mae: list[float] = []
+    psnr: list[float] = []
+    ssim: list[float] = []
+    mouth_mae_values: list[float] = []
+    mouth_psnr_values: list[float] = []
+    mouth_ssim_values: list[float] = []
+    lpips_face_values: list[float] = []
+    lpips_mouth_values: list[float] = []
+    temporal: list[float] = []
+    mouth_temporal: list[float] = []
+    audio_sensitivity: list[float] = []
+    audio_shift_mouth_mae_delta: list[float] = []
+    previous_by_clip: dict[str, tuple[int, torch.Tensor, torch.Tensor]] = {}
     grid_paths: list[str] = []
     for index, batch in enumerate(loader):
         if index >= max_batches:
@@ -196,8 +221,49 @@ def render_validation_artifacts(
         audio = batch["audio"].to(device=device, dtype=torch.float32)
         target_tensor = batch["target"].to(device=device, dtype=torch.float32)
         pred_tensor = model(face, audio)
+        shifted_pred_tensor = model(face, shift_audio_window(audio))
         reconstruction.append(float(charbonnier_loss(pred_tensor, target_tensor).cpu()))
         mouth.append(float(mouth_weighted_l1(pred_tensor, target_tensor).cpu()))
+        mae.extend(image_mae(pred_tensor, target_tensor).cpu().tolist())
+        psnr.extend(image_psnr(pred_tensor, target_tensor).cpu().tolist())
+        ssim.extend(image_ssim(pred_tensor, target_tensor).cpu().tolist())
+        current_mouth_mae = mouth_mae(pred_tensor, target_tensor)
+        shifted_mouth_mae = mouth_mae(shifted_pred_tensor, target_tensor)
+        mouth_mae_values.extend(current_mouth_mae.cpu().tolist())
+        mouth_psnr_values.extend(mouth_psnr(pred_tensor, target_tensor).cpu().tolist())
+        mouth_ssim_values.extend(mouth_ssim(pred_tensor, target_tensor).cpu().tolist())
+        if lpips_evaluator is not None:
+            face_lpips, mouth_lpips = lpips_face_and_mouth(
+                lpips_evaluator,
+                pred_tensor,
+                target_tensor,
+            )
+            lpips_face_values.extend(face_lpips.cpu().tolist())
+            lpips_mouth_values.extend(mouth_lpips.cpu().tolist())
+        audio_sensitivity.extend(mouth_mae(pred_tensor, shifted_pred_tensor).cpu().tolist())
+        audio_shift_mouth_mae_delta.extend((shifted_mouth_mae - current_mouth_mae).cpu().tolist())
+        meta = batch["meta"][0]
+        if isinstance(meta, dict) and "clip_id" in meta and "frame_idx" in meta:
+            clip_id = str(meta["clip_id"])
+            frame_idx = int(meta["frame_idx"])
+            previous = previous_by_clip.get(clip_id)
+            if previous is not None and frame_idx == previous[0] + 1:
+                temporal.append(float(torch.mean(torch.abs(pred_tensor - previous[1])).cpu()))
+                mouth_temporal.extend(
+                    mouth_temporal_error(
+                        pred_tensor,
+                        target_tensor,
+                        previous[1],
+                        previous[2],
+                    )
+                    .cpu()
+                    .tolist()
+                )
+            previous_by_clip[clip_id] = (
+                frame_idx,
+                pred_tensor.detach(),
+                target_tensor.detach(),
+            )
         pred = pred_tensor.cpu().numpy()[0]
         target = target_tensor.cpu().numpy()[0]
         masked = face.cpu().numpy()[0][3:6]
@@ -213,8 +279,25 @@ def render_validation_artifacts(
     metrics = {
         "val_reconstruction_loss": sum(reconstruction) / len(reconstruction),
         "val_mouth_loss": sum(mouth) / len(mouth),
-        "val_temporal_delta": temporal_delta_metric(predictions),
+        "val_temporal_delta": sum(temporal) / len(temporal) if temporal else 0.0,
+        "val_mae": sum(mae) / len(mae),
+        "val_psnr": sum(psnr) / len(psnr),
+        "val_ssim": sum(ssim) / len(ssim),
+        "val_mouth_mae": sum(mouth_mae_values) / len(mouth_mae_values),
+        "val_mouth_psnr": sum(mouth_psnr_values) / len(mouth_psnr_values),
+        "val_mouth_ssim": sum(mouth_ssim_values) / len(mouth_ssim_values),
+        "val_mouth_temporal_error": (
+            sum(mouth_temporal) / len(mouth_temporal) if mouth_temporal else 0.0
+        ),
+        "val_temporal_pair_count": float(len(mouth_temporal)),
+        "val_audio_sensitivity": sum(audio_sensitivity) / len(audio_sensitivity),
+        "val_audio_shift_mouth_mae_delta": (
+            sum(audio_shift_mouth_mae_delta) / len(audio_shift_mouth_mae_delta)
+        ),
     }
+    if lpips_face_values:
+        metrics["val_lpips_face"] = sum(lpips_face_values) / len(lpips_face_values)
+        metrics["val_lpips_mouth"] = sum(lpips_mouth_values) / len(lpips_mouth_values)
     video_path = output / "validation_grids.mp4"
     metadata_path = write_rgb_video(
         grid_frames,
