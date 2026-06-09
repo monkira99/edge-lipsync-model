@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
@@ -151,6 +152,34 @@ def collate_training_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _sample_weights_from_metadata(
+    batch: dict[str, Any],
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    metadata = batch.get("meta")
+    if not isinstance(metadata, list):
+        return None
+    if not any(isinstance(meta, dict) and "sample_weight" in meta for meta in metadata):
+        return None
+    weights = [
+        float(meta.get("sample_weight", 1.0)) if isinstance(meta, dict) else 1.0
+        for meta in metadata
+    ]
+    return torch.tensor(weights, device=device, dtype=torch.float32)
+
+
+def _loss_accepts_sample_weight(loss_fn: Callable[..., torch.Tensor]) -> bool:
+    try:
+        signature = inspect.signature(loss_fn)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        name == "sample_weight" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for name, parameter in signature.parameters.items()
+    )
+
+
 def _forward_model(
     model: torch.nn.Module,
     face: torch.Tensor,
@@ -167,7 +196,7 @@ def run_train_step(
     batch: dict[str, Any],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    loss_fn: Callable[..., torch.Tensor],
     audio_optional: bool = False,
     mixed_precision: bool = False,
     scaler: torch.amp.GradScaler | None = None,
@@ -180,7 +209,12 @@ def run_train_step(
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, enabled=mixed_precision):
         pred = _forward_model(model, face, audio_tensor if not audio_optional else None)
-        loss = loss_fn(pred, target)
+        sample_weight = _sample_weights_from_metadata(batch, device=device)
+        loss = (
+            loss_fn(pred, target, sample_weight=sample_weight)
+            if sample_weight is not None and _loss_accepts_sample_weight(loss_fn)
+            else loss_fn(pred, target)
+        )
     if not torch.isfinite(loss):
         raise FloatingPointError(f"Non-finite loss: {float(loss.detach().cpu())}")
     if scaler is not None and mixed_precision:
@@ -828,13 +862,19 @@ def train(config: TrainConfig) -> Path:
         )
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
 
-        def training_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        def training_loss(
+            pred: torch.Tensor,
+            target: torch.Tensor,
+            *,
+            sample_weight: torch.Tensor | None = None,
+        ) -> torch.Tensor:
             return combined_training_loss(
                 pred,
                 target,
                 lpips_evaluator=lpips_evaluator,
                 lpips_face_weight=config.lpips_face_loss_weight,
                 lpips_mouth_weight=config.lpips_mouth_loss_weight,
+                sample_weight=sample_weight,
             )
 
         metrics: list[dict[str, float | int | str]] = []

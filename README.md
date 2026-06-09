@@ -118,8 +118,8 @@ original MP4 files.
 Inspect `reports/quality/*_frame_decisions.parquet` for one decision per normalized talking frame.
 Preview groups live under `reports/previews/<clip_id>/` and include best matches, near-threshold
 matches, low-sync-confidence retained rows, retained idle rows when available, and frequent
-rejection reasons. `sample_weight` is stored as metadata only in V1; the training loss does not
-apply it.
+rejection reasons. `sample_weight` is propagated through training metadata and applied by the
+training loss, so retained idle rows can contribute less than speech rows.
 
 Hub is transport only for these snapshots. Upload the complete saved directory, record the full
 commit SHA, then download that immutable revision once on the training machine:

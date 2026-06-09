@@ -45,6 +45,41 @@ def test_training_step_updates_parameters() -> None:
     assert not torch.equal(before, model.weight.detach())
 
 
+def test_training_step_applies_sample_weights_from_metadata() -> None:
+    from edge_lipsync.losses import combined_reconstruction_loss
+    from edge_lipsync.training import run_train_step
+
+    model = _FaceAudioModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    batch = {
+        "face": torch.zeros(2, 6, 160, 160),
+        "audio": torch.zeros(2, 20, 256),
+        "target": torch.stack(
+            [
+                torch.ones(3, 160, 160),
+                torch.full((3, 160, 160), 3.0),
+            ]
+        ),
+        "meta": [{"sample_weight": 1.0}, {"sample_weight": 0.25}],
+    }
+
+    with torch.no_grad():
+        pred = model(batch["face"], batch["audio"])
+        first = combined_reconstruction_loss(pred[:1], batch["target"][:1])
+        second = combined_reconstruction_loss(pred[1:], batch["target"][1:])
+        expected = (first + 0.25 * second) / 1.25
+
+    loss = run_train_step(
+        model=model,
+        batch=batch,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        loss_fn=combined_reconstruction_loss,
+    )
+
+    assert loss == pytest.approx(float(expected))
+
+
 def test_training_step_rejects_non_finite_loss() -> None:
     from edge_lipsync.training import run_train_step
 
