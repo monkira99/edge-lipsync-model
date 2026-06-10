@@ -160,6 +160,57 @@ def test_duix_hf_dataset_loads_silent_talking_roi_row() -> None:
     assert not np.array_equal(sample["face"][:3].numpy(), sample["target"].numpy())
 
 
+def test_duix_hf_dataset_loads_v2_identity_similarity_metadata() -> None:
+    from datasets import Dataset, DatasetDict, Features, Image, Sequence, Value
+
+    from edge_lipsync.dataset import DuixHFDataset
+
+    image = np.full((168, 168, 3), 120, dtype=np.uint8)
+    _, encoded = cv2.imencode(".png", image)
+    features = Features(
+        {
+            "schema_version": Value("string"),
+            "persona_id": Value("string"),
+            "pair_id": Value("string"),
+            "talking_clip_id": Value("string"),
+            "source_frame_idx": Value("int32"),
+            "target_frame_idx": Value("int32"),
+            "audio_idx": Value("int32"),
+            "source_roi": Image(),
+            "target_roi": Image(),
+            "audio": Sequence(Sequence(Value("float32"), length=256), length=20),
+            "source_bbox_xyxy": Sequence(Value("int32"), length=4),
+            "target_bbox_xyxy": Sequence(Value("int32"), length=4),
+            "sample_weight": Value("float32"),
+            "identity_similarity": Value("float32"),
+            "flags": Sequence(Value("string")),
+        }
+    )
+    row = {
+        "schema_version": "edge_lipsync_silent_talking_pair_v2",
+        "persona_id": "nora",
+        "pair_id": "pair",
+        "talking_clip_id": "talk",
+        "source_frame_idx": 2,
+        "target_frame_idx": 1,
+        "audio_idx": 0,
+        "source_roi": {"bytes": encoded.tobytes(), "path": None},
+        "target_roi": {"bytes": encoded.tobytes(), "path": None},
+        "audio": np.zeros((20, 256), dtype=np.float32),
+        "source_bbox_xyxy": [10, 20, 110, 120],
+        "target_bbox_xyxy": [12, 22, 112, 122],
+        "sample_weight": 1.0,
+        "identity_similarity": 0.91,
+        "flags": [],
+    }
+    dataset = DatasetDict({"train": Dataset.from_list([row], features=features)})
+
+    sample = DuixHFDataset(dataset, split="train")[0]
+
+    assert tuple(sample["face"].shape) == (6, 160, 160)
+    assert sample["meta"]["identity_similarity"] == pytest.approx(0.91)
+
+
 def test_hf_image_feature_roundtrips_embedded_png_without_path(tmp_path: Path) -> None:
     from datasets import Dataset, Features, Image, load_from_disk
 

@@ -29,6 +29,14 @@ matching:
 post_crop_alignment:
   max_stable_landmark_rmse: 0.04
   max_mouth_center_delta: 0.04
+identity:
+  arcface_onnx: ""
+  hf_repo: facefusion/models-3.0.0
+  hf_filename: arcface_w600k_r50.onnx
+  hf_revision: 728b9659bd9691bf32cbf7f61af478d94b7ba81e
+  cache_dir: ""
+  expected_sha256: f1f79dc3b0b79a69f94799af1fffebff09fbd78fd96a275fd8f0cbbea23270d1
+  min_cosine_similarity: 0.35
 blur:
   min_source_face_laplacian_variance: 60.0
   min_target_face_laplacian_variance: 60.0

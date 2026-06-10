@@ -8,16 +8,19 @@ from dataclasses import dataclass, replace
 import cv2
 import numpy as np
 
+from edge_lipsync.identity import cosine_identity_similarity
 from edge_lipsync.preprocess import BBox, Point
 
 HEAD_POSE_LANDMARK_INDICES = (1, 10, 33, 234, 263, 454)
 STABLE_ALIGNMENT_LANDMARK_INDICES = (1, 33, 152, 234, 263, 454)
+IDENTITY_LANDMARK_INDICES = (1, 33, 61, 133, 263, 291, 362)
 MOUTH_CORNER_INDICES = (61, 291)
 MOUTH_VERTICAL_INDICES = (13, 14)
 TRACKED_LANDMARK_INDICES = tuple(
     sorted(
         set(HEAD_POSE_LANDMARK_INDICES)
         | set(STABLE_ALIGNMENT_LANDMARK_INDICES)
+        | set(IDENTITY_LANDMARK_INDICES)
         | set(MOUTH_CORNER_INDICES)
         | set(MOUTH_VERTICAL_INDICES)
     )
@@ -63,6 +66,7 @@ class FrameObservation:
     mouth_blur: float
     mouth_open: float
     landmark_valid: bool
+    identity_embedding: np.ndarray | None = None
     bbox_continuity_valid: bool = True
     reject_reason: str = ""
 
@@ -116,13 +120,32 @@ class MatchResult:
     width_ratio: float
     height_ratio: float
     alignment: AlignmentMetrics
+    identity_similarity: float
+    identity_mismatch_candidate_count: int
+    identity_max_rejected_similarity: float | None
 
 
 class PostCropAlignmentMismatch(ValueError):
-    def __init__(self, *, stable_landmark_failures: int, mouth_center_failures: int) -> None:
+    def __init__(
+        self,
+        *,
+        stable_landmark_failures: int,
+        mouth_center_failures: int,
+        identity_mismatch_candidate_count: int = 0,
+        identity_max_rejected_similarity: float | None = None,
+    ) -> None:
         super().__init__("post_crop_alignment_mismatch")
         self.stable_landmark_failures = stable_landmark_failures
         self.mouth_center_failures = mouth_center_failures
+        self.identity_mismatch_candidate_count = identity_mismatch_candidate_count
+        self.identity_max_rejected_similarity = identity_max_rejected_similarity
+
+
+class IdentityMismatch(ValueError):
+    def __init__(self, *, candidate_count: int, max_similarity: float | None) -> None:
+        super().__init__("identity_mismatch")
+        self.candidate_count = candidate_count
+        self.max_similarity = max_similarity
 
 
 def normalized_bbox_geometry(
@@ -484,6 +507,8 @@ def match_silent_observation(
     target: FrameObservation,
     silent_candidates: list[FrameObservation],
     config: MatchConfig,
+    *,
+    min_identity_similarity: float = 0.35,
 ) -> MatchResult:
     if not _candidate_observation_valid(target):
         raise ValueError(target.reject_reason or "invalid_target_observation")
@@ -537,14 +562,71 @@ def match_silent_observation(
     if not pose_geometry_candidates:
         raise ValueError("pose_geometry_no_match")
 
-    stable_landmark_failures = 0
-    mouth_center_failures = 0
-    scored: list[
-        tuple[float, FrameObservation, HeadPose, float, float, float, float, AlignmentMetrics]
+    if target.identity_embedding is None:
+        raise ValueError("identity_embedding_missing")
+    identity_mismatch_candidate_count = 0
+    rejected_identity_similarities: list[float] = []
+    identity_candidates: list[
+        tuple[FrameObservation, HeadPose, float, float, float, float, float]
     ] = []
     for source, pose_delta, center_delta_x, center_delta_y, width_ratio, height_ratio in (
         pose_geometry_candidates
     ):
+        if source.identity_embedding is None:
+            continue
+        similarity = cosine_identity_similarity(
+            source.identity_embedding,
+            target.identity_embedding,
+        )
+        if similarity < min_identity_similarity:
+            identity_mismatch_candidate_count += 1
+            rejected_identity_similarities.append(similarity)
+            continue
+        identity_candidates.append(
+            (
+                source,
+                pose_delta,
+                center_delta_x,
+                center_delta_y,
+                width_ratio,
+                height_ratio,
+                similarity,
+            )
+        )
+    if not identity_candidates:
+        raise IdentityMismatch(
+            candidate_count=identity_mismatch_candidate_count,
+            max_similarity=(
+                max(rejected_identity_similarities)
+                if rejected_identity_similarities
+                else None
+            ),
+        )
+
+    stable_landmark_failures = 0
+    mouth_center_failures = 0
+    scored: list[
+        tuple[
+            float,
+            FrameObservation,
+            HeadPose,
+            float,
+            float,
+            float,
+            float,
+            AlignmentMetrics,
+            float,
+        ]
+    ] = []
+    for (
+        source,
+        pose_delta,
+        center_delta_x,
+        center_delta_y,
+        width_ratio,
+        height_ratio,
+        identity_similarity,
+    ) in identity_candidates:
         assert source.bbox_xyxy is not None
         alignment = post_crop_alignment(
             source.landmarks,
@@ -576,12 +658,19 @@ def match_silent_observation(
                 width_ratio,
                 height_ratio,
                 alignment,
+                identity_similarity,
             )
         )
     if not scored:
         raise PostCropAlignmentMismatch(
             stable_landmark_failures=stable_landmark_failures,
             mouth_center_failures=mouth_center_failures,
+            identity_mismatch_candidate_count=identity_mismatch_candidate_count,
+            identity_max_rejected_similarity=(
+                max(rejected_identity_similarities)
+                if rejected_identity_similarities
+                else None
+            ),
         )
 
     scored.sort(key=lambda item: (item[0], item[1].frame_idx))
@@ -601,6 +690,11 @@ def match_silent_observation(
         width_ratio=float(best[5]),
         height_ratio=float(best[6]),
         alignment=best[7],
+        identity_similarity=float(best[8]),
+        identity_mismatch_candidate_count=identity_mismatch_candidate_count,
+        identity_max_rejected_similarity=(
+            max(rejected_identity_similarities) if rejected_identity_similarities else None
+        ),
     )
 
 

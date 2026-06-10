@@ -20,11 +20,18 @@ from edge_lipsync.audio_features import (
     split_audio_blocks,
 )
 from edge_lipsync.build_dataset import FRAME_SUFFIX, extract_frames, require_tool, run
+from edge_lipsync.identity import (
+    IdentityConfig,
+    IdentityFrameError,
+    IdentityRuntimeError,
+    create_identity_runtime,
+)
 from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
 from edge_lipsync.pose_pairing import (
     TRACKED_LANDMARK_INDICES,
     FrameObservation,
     HeadPose,
+    IdentityMismatch,
     MatchConfig,
     PostCropAlignmentMismatch,
     SyncWindow,
@@ -45,7 +52,7 @@ from edge_lipsync.pose_pairing import (
 from edge_lipsync.preprocess import ROI_SOURCE_SIZE, BBox, landmarks_to_duix_roi
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv"}
-SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v1"
+SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v2"
 
 SILENT_TALKING_FEATURES = Features(
     {
@@ -79,6 +86,7 @@ SILENT_TALKING_FEATURES = Features(
         "height_ratio": Value("float32"),
         "stable_landmark_alignment_rmse": Value("float32"),
         "mouth_center_delta_after_crop": Value("float32"),
+        "identity_similarity": Value("float32"),
         "matching_score": Value("float32"),
         "valid_silent_candidate_count": Value("int32"),
         "second_best_matching_score": Value("float32"),
@@ -99,6 +107,14 @@ class LandmarkDetector(Protocol):
     ) -> Mapping[int, tuple[float, float]] | None: ...
 
     def close(self) -> None: ...
+
+
+class IdentityRuntime(Protocol):
+    def embed(
+        self,
+        frame_bgr: np.ndarray,
+        landmarks: Mapping[int, tuple[float, float]],
+    ) -> np.ndarray: ...
 
 
 @dataclass(frozen=True)
@@ -137,6 +153,7 @@ class SilentTalkingBuildConfig:
     progress: bool = True
     strict: bool = False
     match: MatchConfig = field(default_factory=MatchConfig)
+    identity: IdentityConfig = field(default_factory=IdentityConfig)
     blur: BlurConfig = field(default_factory=BlurConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
 
@@ -264,6 +281,11 @@ def observation_to_json(observation: FrameObservation) -> dict[str, Any]:
         "mouth_blur": observation.mouth_blur,
         "mouth_open": observation.mouth_open,
         "landmark_valid": observation.landmark_valid,
+        "identity_embedding": (
+            observation.identity_embedding.tolist()
+            if observation.identity_embedding is not None
+            else None
+        ),
         "bbox_continuity_valid": observation.bbox_continuity_valid,
         "reject_reason": observation.reject_reason,
     }
@@ -278,6 +300,7 @@ def observation_from_json(payload: dict[str, Any]) -> FrameObservation:
             raise ValueError(f"bbox_xyxy must have 4 values: {bbox}")
         bbox_xyxy = (values[0], values[1], values[2], values[3])
     pose = payload.get("pose")
+    identity_embedding = payload.get("identity_embedding")
     return FrameObservation(
         frame_idx=int(payload["frame_idx"]),
         bbox_xyxy=bbox_xyxy,
@@ -292,6 +315,11 @@ def observation_from_json(payload: dict[str, Any]) -> FrameObservation:
         mouth_blur=float(payload["mouth_blur"]),
         mouth_open=float(payload["mouth_open"]),
         landmark_valid=bool(payload["landmark_valid"]),
+        identity_embedding=(
+            np.asarray(identity_embedding, dtype=np.float32)
+            if identity_embedding is not None
+            else None
+        ),
         bbox_continuity_valid=bool(payload.get("bbox_continuity_valid", True)),
         reject_reason=str(payload.get("reject_reason", "")),
     )
@@ -355,6 +383,7 @@ def _invalid_observation(
         mouth_blur=0.0,
         mouth_open=0.0,
         landmark_valid=False,
+        identity_embedding=None,
         bbox_continuity_valid=False,
         reject_reason=reject_reason,
     )
@@ -373,6 +402,7 @@ def analyze_frames(
     *,
     frame_count: int,
     detector: LandmarkDetector,
+    identity_runtime: IdentityRuntime,
     cache_path: str | Path,
     cache_metadata: dict[str, Any],
     is_target: bool,
@@ -430,6 +460,17 @@ def analyze_frames(
                 )
             )
             continue
+        try:
+            identity_embedding = identity_runtime.embed(frame, tracked_landmarks)
+        except IdentityFrameError as exc:
+            observations.append(
+                _invalid_observation(
+                    frame_idx=frame_idx,
+                    frame_shape=frame.shape,
+                    reject_reason=str(exc),
+                )
+            )
+            continue
         frame_height, frame_width = frame.shape[:2]
         observations.append(
             FrameObservation(
@@ -443,6 +484,7 @@ def analyze_frames(
                 mouth_blur=mouth_blur,
                 mouth_open=mouth_open,
                 landmark_valid=True,
+                identity_embedding=identity_embedding,
             )
         )
     observations = mark_bbox_continuity(observations)
@@ -494,6 +536,9 @@ def _base_decision(
         "matching_score": None,
         "stable_landmark_alignment_rmse": None,
         "mouth_center_delta_after_crop": None,
+        "identity_similarity": None,
+        "identity_mismatch_candidate_count": 0,
+        "identity_max_rejected_similarity": None,
         "post_crop_alignment_mismatch_stable_landmark": 0,
         "post_crop_alignment_mismatch_mouth_center": 0,
     }
@@ -523,6 +568,7 @@ def _valid_silent_sources(
         and observation.bbox_continuity_valid
         and observation.bbox_xyxy is not None
         and observation.pose is not None
+        and observation.identity_embedding is not None
         and observation.face_blur >= blur.min_source_face_laplacian_variance
     ]
 
@@ -606,7 +652,12 @@ def build_pair_decisions(
             _reject(decision, sync_reason)
             continue
         try:
-            match = match_silent_observation(observation, valid_silent, config.match)
+            match = match_silent_observation(
+                observation,
+                valid_silent,
+                config.match,
+                min_identity_similarity=config.identity.min_cosine_similarity,
+            )
         except ValueError as exc:
             if isinstance(exc, PostCropAlignmentMismatch):
                 decision["post_crop_alignment_mismatch_stable_landmark"] = (
@@ -614,6 +665,17 @@ def build_pair_decisions(
                 )
                 decision["post_crop_alignment_mismatch_mouth_center"] = (
                     int(exc.mouth_center_failures > 0)
+                )
+                decision["identity_mismatch_candidate_count"] = (
+                    exc.identity_mismatch_candidate_count
+                )
+                decision["identity_max_rejected_similarity"] = _finite_optional(
+                    exc.identity_max_rejected_similarity
+                )
+            elif isinstance(exc, IdentityMismatch):
+                decision["identity_mismatch_candidate_count"] = exc.candidate_count
+                decision["identity_max_rejected_similarity"] = _finite_optional(
+                    exc.max_similarity
                 )
             _reject(decision, str(exc))
             continue
@@ -633,6 +695,13 @@ def build_pair_decisions(
                 "matching_score": match.matching_score,
                 "stable_landmark_alignment_rmse": match.alignment.stable_landmark_rmse,
                 "mouth_center_delta_after_crop": match.alignment.mouth_center_delta,
+                "identity_similarity": match.identity_similarity,
+                "identity_mismatch_candidate_count": (
+                    match.identity_mismatch_candidate_count
+                ),
+                "identity_max_rejected_similarity": _finite_optional(
+                    match.identity_max_rejected_similarity
+                ),
             }
         )
         provisional_rows.append(
@@ -668,6 +737,7 @@ def build_pair_decisions(
                 "height_ratio": float(match.height_ratio),
                 "stable_landmark_alignment_rmse": float(match.alignment.stable_landmark_rmse),
                 "mouth_center_delta_after_crop": float(match.alignment.mouth_center_delta),
+                "identity_similarity": float(match.identity_similarity),
                 "matching_score": float(match.matching_score),
                 "valid_silent_candidate_count": int(match.valid_candidate_count),
                 "second_best_matching_score": _finite_optional(match.second_best_score),
@@ -862,6 +932,7 @@ def quality_report(
     talking_observations: list[FrameObservation],
     decisions: list[dict[str, Any]],
     rows: list[dict[str, Any]],
+    identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reject_counts = Counter(
         str(decision["reject_reason"])
@@ -877,7 +948,7 @@ def quality_report(
         for decision in decisions
     )
     retained = [row for row in rows if row["talking_clip_id"] == clip_id]
-    return {
+    report = {
         "clip_id": clip_id,
         "status": "ready" if retained else "no_valid_samples",
         "frame_count": len(talking_observations),
@@ -908,6 +979,17 @@ def quality_report(
         ),
         "post_crop_alignment_mismatch_stable_landmark": stable_mismatch,
         "post_crop_alignment_mismatch_mouth_center": mouth_mismatch,
+        "identity_mismatch_count": reject_counts.get("identity_mismatch", 0),
+        "identity_similarity": _distribution(
+            [float(row["identity_similarity"]) for row in retained]
+        ),
+        "identity_max_rejected_similarity": _distribution(
+            [
+                float(decision["identity_max_rejected_similarity"])
+                for decision in decisions
+                if decision.get("identity_max_rejected_similarity") is not None
+            ]
+        ),
         "matching_score": _distribution([float(row["matching_score"]) for row in retained]),
         "valid_silent_candidate_count": _distribution(
             [float(row["valid_silent_candidate_count"]) for row in retained]
@@ -923,6 +1005,9 @@ def quality_report(
         "speech_pair_count": sum(not row["is_idle"] for row in retained),
         "retained_idle_pair_count": sum(row["is_idle"] for row in retained),
     }
+    if identity is not None:
+        report["identity"] = identity
+    return report
 
 
 def _decode_png_cell(cell: dict[str, Any]) -> np.ndarray:
@@ -964,6 +1049,7 @@ def _write_pair_preview(path: Path, row: dict[str, Any]) -> None:
             f"{float(row['pose_delta_pitch']):.2f},{float(row['pose_delta_roll']):.2f})",
             f"center=({float(row['center_delta_x']):.4f},{float(row['center_delta_y']):.4f})",
             f"scale=({float(row['width_ratio']):.3f},{float(row['height_ratio']):.3f})",
+            f"identity={float(row['identity_similarity']):.4f}",
             f"sync={row['sync_best_lag_frames']} {row['sync_confidence']}",
             f"blur=({float(row['source_face_blur']):.1f},"
             f"{float(row['target_face_blur']):.1f},{float(row['target_mouth_blur']):.1f})",
@@ -1029,6 +1115,9 @@ def _preview_rows(rows: list[dict[str, Any]], count: int) -> dict[str, list[dict
             ),
             reverse=True,
         ),
+        "near_identity_threshold": top(
+            lambda row: float(row["identity_similarity"]),
+        ),
         "low_sync_confidence": top(
             lambda row: float(row["matching_score"]),
             predicate=lambda row: row["sync_confidence"] == "low",
@@ -1068,6 +1157,16 @@ def _validate_config(config: SilentTalkingBuildConfig) -> None:
         raise ValueError("validation_fraction must be between 0 and 1")
     if not 0.0 <= config.idle_max_ratio <= 1.0:
         raise ValueError("idle_max_ratio must be between 0 and 1")
+    if not -1.0 <= config.identity.min_cosine_similarity <= 1.0:
+        raise ValueError("identity.min_cosine_similarity must be between -1 and 1")
+    if len(config.identity.expected_sha256) != 64:
+        raise ValueError("identity.expected_sha256 must contain 64 hexadecimal characters")
+    try:
+        int(config.identity.expected_sha256, 16)
+    except ValueError as exc:
+        raise ValueError(
+            "identity.expected_sha256 must contain 64 hexadecimal characters"
+        ) from exc
     if not config.silent_video_path.is_file():
         raise FileNotFoundError(config.silent_video_path)
     if not Path(config.wenet_onnx).is_file():
@@ -1119,12 +1218,17 @@ def _write_failed_clip_report(path: Path, clip_id: str, exc: Exception) -> None:
     )
 
 
+def _clip_failure_is_fatal(exc: Exception) -> bool:
+    return isinstance(exc, IdentityRuntimeError)
+
+
 def _build_snapshot_contents(
     config: SilentTalkingBuildConfig,
     temporary_root: Path,
 ) -> dict[str, Any]:
     cfg_hash = config_sha256(config)
     work_root = Path(config.work_root) / config.persona_id
+    identity_runtime, identity_provenance = create_identity_runtime(config.identity)
     silent_work = work_root / "normalized" / "silent"
     silent_video = normalize_visual_video(
         config.silent_video_path,
@@ -1144,6 +1248,7 @@ def _build_snapshot_contents(
             silent_frames_dir,
             frame_count=silent_frame_count,
             detector=silent_detector,
+            identity_runtime=identity_runtime,
             cache_path=work_root / "analysis" / "silent" / "analysis.jsonl",
             cache_metadata={
                 "config_sha256": cfg_hash,
@@ -1165,6 +1270,7 @@ def _build_snapshot_contents(
                 "source_face": _distribution([item.face_blur for item in silent_observations]),
             },
             "pose_by_mouth_openness_quantile": _pose_by_mouth_quantile(silent_observations),
+            "identity": identity_provenance,
         },
     )
 
@@ -1209,6 +1315,7 @@ def _build_snapshot_contents(
                     frames_dir,
                     frame_count=frame_count,
                     detector=talking_detector,
+                    identity_runtime=identity_runtime,
                     cache_path=work_root / "analysis" / "talking" / clip_id / "analysis.jsonl",
                     cache_metadata={
                         "config_sha256": cfg_hash,
@@ -1268,6 +1375,7 @@ def _build_snapshot_contents(
                     talking_observations=talking_observations,
                     decisions=result.decisions,
                     rows=attached,
+                    identity=identity_provenance,
                 ),
             )
             write_preview_groups(
@@ -1277,6 +1385,8 @@ def _build_snapshot_contents(
                 count=config.preview_count_per_group,
             )
         except Exception as exc:
+            if _clip_failure_is_fatal(exc):
+                raise
             failed_clips.append(clip_id)
             _write_failed_clip_report(
                 temporary_root / "reports/quality" / f"{clip_id}.json",
@@ -1296,6 +1406,7 @@ def _build_snapshot_contents(
         "split_mode": split_mode,
         "decision_paths": all_decision_paths,
         "row_count": len(rows),
+        "identity": identity_provenance,
     }
 
 
@@ -1359,6 +1470,7 @@ def build_silent_talking_dataset(
 def build_config_from_mapping(payload: dict[str, Any]) -> SilentTalkingBuildConfig:
     values = dict(payload)
     values["match"] = MatchConfig(**dict(values.pop("matching", {})))
+    values["identity"] = IdentityConfig(**dict(values.pop("identity", {})))
     values["blur"] = BlurConfig(**dict(values.pop("blur", {})))
     sync_values = dict(values.pop("sync", {}))
     values["sync"] = SyncConfig(**sync_values)

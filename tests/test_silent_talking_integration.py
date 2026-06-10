@@ -154,6 +154,7 @@ def test_local_snapshot_runs_one_training_step_without_network(
 )
 def test_nora_sample_builds_and_loads_snapshot(tmp_path: Path) -> None:
     from edge_lipsync.dataset import DuixHFDataset
+    from edge_lipsync.identity import IdentityConfig
     from edge_lipsync.silent_talking_dataset import (
         SilentTalkingBuildConfig,
         build_silent_talking_dataset,
@@ -170,6 +171,9 @@ def test_nora_sample_builds_and_loads_snapshot(tmp_path: Path) -> None:
             work_root=str(tmp_path / "work"),
             wenet_onnx=str(wenet),
             landmark_model_asset_path=str(landmarker),
+            identity=IdentityConfig(
+                arcface_onnx=os.environ.get("EDGE_LIPSYNC_ARCFACE_ONNX", ""),
+            ),
             progress=False,
             strict=True,
         )

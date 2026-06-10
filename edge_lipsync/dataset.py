@@ -15,7 +15,12 @@ from torch.utils.data import Dataset as TorchDataset
 from edge_lipsync.audio_features import get_bnf_window
 from edge_lipsync.preprocess import make_face_training_sample, make_face_training_sample_from_rois
 
-SILENT_TALKING_SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v1"
+SILENT_TALKING_SCHEMA_VERSION_V1 = "edge_lipsync_silent_talking_pair_v1"
+SILENT_TALKING_SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v2"
+SILENT_TALKING_SCHEMA_VERSIONS = {
+    SILENT_TALKING_SCHEMA_VERSION_V1,
+    SILENT_TALKING_SCHEMA_VERSION,
+}
 
 
 def _require_relative_path(value: object, field: str) -> str:
@@ -154,7 +159,7 @@ def _silent_talking_hf_sample(row: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Invalid audio shape={audio.shape}, expected=(20, 256)")
     sample = make_face_training_sample_from_rois(source_roi, target_roi)
     meta = {
-        "schema_version": SILENT_TALKING_SCHEMA_VERSION,
+        "schema_version": str(row["schema_version"]),
         "persona_id": str(row["persona_id"]),
         "pair_id": str(row["pair_id"]),
         "clip_id": str(row["talking_clip_id"]),
@@ -182,6 +187,7 @@ def _silent_talking_hf_sample(row: dict[str, Any]) -> dict[str, Any]:
         "height_ratio",
         "stable_landmark_alignment_rmse",
         "mouth_center_delta_after_crop",
+        "identity_similarity",
         "matching_score",
         "valid_silent_candidate_count",
         "second_best_matching_score",
@@ -214,7 +220,7 @@ class DuixHFDataset(TorchDataset[dict[str, Any]]):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.dataset[index]
-        if row.get("schema_version") == SILENT_TALKING_SCHEMA_VERSION:
+        if row.get("schema_version") in SILENT_TALKING_SCHEMA_VERSIONS:
             return _silent_talking_hf_sample(row)
         bbox = tuple(int(value) for value in row["bbox_xyxy"])
         if len(bbox) != 4:

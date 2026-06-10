@@ -12,9 +12,11 @@ def _landmarks() -> dict[int, tuple[float, float]]:
         1: (100.0, 90.0),
         10: (100.0, 45.0),
         33: (70.0, 70.0),
+        133: (90.0, 70.0),
         61: (82.0, 118.0),
         152: (100.0, 150.0),
         234: (55.0, 100.0),
+        362: (110.0, 70.0),
         263: (130.0, 70.0),
         291: (118.0, 118.0),
         454: (145.0, 100.0),
@@ -168,6 +170,7 @@ def _observation(
     frame_idx: int,
     mouth_shift: float = 0.0,
     yaw_shift: float = 0.0,
+    identity_axis: int = 0,
 ) -> Any:
     from edge_lipsync.pose_pairing import FrameObservation, HeadPose
 
@@ -175,6 +178,8 @@ def _observation(
     for index in (61, 291):
         x, y = landmarks[index]
         landmarks[index] = (x + mouth_shift, y)
+    identity_embedding = np.zeros(512, dtype=np.float32)
+    identity_embedding[identity_axis] = 1.0
     return FrameObservation(
         frame_idx=frame_idx,
         bbox_xyxy=(50, 40, 150, 160),
@@ -186,6 +191,7 @@ def _observation(
         mouth_blur=100.0,
         mouth_open=0.2,
         landmark_valid=True,
+        identity_embedding=identity_embedding,
     )
 
 
@@ -222,6 +228,51 @@ def test_matching_filters_alignment_before_scoring() -> None:
     assert result.selected.frame_idx == 2
     assert result.valid_candidate_count == 1
     assert result.second_best_score is None
+
+
+def test_matching_skips_identity_mismatch_and_uses_next_candidate() -> None:
+    from edge_lipsync.pose_pairing import MatchConfig, match_silent_observation
+
+    target = _observation(frame_idx=10)
+    wrong_identity = _observation(frame_idx=1, identity_axis=1)
+    valid_second = _observation(frame_idx=2, yaw_shift=1.0)
+
+    result = match_silent_observation(
+        target,
+        [wrong_identity, valid_second],
+        MatchConfig(),
+        min_identity_similarity=0.35,
+    )
+
+    assert result.selected.frame_idx == 2
+    assert result.identity_similarity == pytest.approx(1.0)
+    assert result.identity_mismatch_candidate_count == 1
+    assert result.identity_max_rejected_similarity == pytest.approx(0.0)
+
+
+def test_matching_reports_identity_mismatch_when_all_pose_candidates_fail() -> None:
+    from edge_lipsync.pose_pairing import (
+        IdentityMismatch,
+        MatchConfig,
+        match_silent_observation,
+    )
+
+    target = _observation(frame_idx=10)
+    candidates = [
+        _observation(frame_idx=1, identity_axis=1),
+        _observation(frame_idx=2, identity_axis=2),
+    ]
+
+    with pytest.raises(IdentityMismatch) as captured:
+        match_silent_observation(
+            target,
+            candidates,
+            MatchConfig(),
+            min_identity_similarity=0.35,
+        )
+
+    assert captured.value.candidate_count == 2
+    assert captured.value.max_similarity == pytest.approx(0.0)
 
 
 def test_matching_tie_breaks_by_silent_frame_index_and_reports_margin() -> None:
@@ -269,6 +320,7 @@ def test_matching_uses_shortest_angle_delta_for_roll_wraparound() -> None:
             mouth_blur=100.0,
             mouth_open=0.2,
             landmark_valid=True,
+            identity_embedding=np.eye(1, 512, 0, dtype=np.float32)[0],
         )
 
     result = match_silent_observation(

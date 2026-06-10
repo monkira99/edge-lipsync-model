@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -54,6 +56,15 @@ def test_analyze_frames_writes_reusable_jsonl_cache(
         def close(self) -> None:
             pass
 
+    class FakeIdentityRuntime:
+        def embed(
+            self,
+            frame_bgr: np.ndarray,
+            landmarks: Mapping[int, tuple[float, float]],
+        ) -> np.ndarray:
+            del frame_bgr, landmarks
+            return np.eye(1, 512, 0, dtype=np.float32)[0]
+
     monkeypatch.setattr(
         builder,
         "estimate_head_pose",
@@ -65,6 +76,7 @@ def test_analyze_frames_writes_reusable_jsonl_cache(
         frames,
         frame_count=1,
         detector=FakeDetector(),
+        identity_runtime=FakeIdentityRuntime(),
         cache_path=cache,
         cache_metadata={"config_sha256": "abc", "input_sha256": "def"},
         is_target=True,
@@ -100,6 +112,15 @@ def test_analyze_frames_rebuilds_when_cache_metadata_changes(
         def close(self) -> None:
             pass
 
+    class FakeIdentityRuntime:
+        def embed(
+            self,
+            frame_bgr: np.ndarray,
+            landmarks: Mapping[int, tuple[float, float]],
+        ) -> np.ndarray:
+            del frame_bgr, landmarks
+            raise AssertionError("Invalid frames must not run ArcFace")
+
     cache = tmp_path / "analysis.jsonl"
     first = {"config_sha256": "a", "input_sha256": "x"}
     second = {"config_sha256": "b", "input_sha256": "x"}
@@ -107,6 +128,7 @@ def test_analyze_frames_rebuilds_when_cache_metadata_changes(
         frames,
         frame_count=1,
         detector=FakeDetector(),
+        identity_runtime=FakeIdentityRuntime(),
         cache_path=cache,
         cache_metadata=first,
         is_target=True,
@@ -116,6 +138,7 @@ def test_analyze_frames_rebuilds_when_cache_metadata_changes(
         frames,
         frame_count=1,
         detector=FakeDetector(),
+        identity_runtime=FakeIdentityRuntime(),
         cache_path=cache,
         cache_metadata=first,
         is_target=True,
@@ -125,6 +148,7 @@ def test_analyze_frames_rebuilds_when_cache_metadata_changes(
         frames,
         frame_count=1,
         detector=FakeDetector(),
+        identity_runtime=FakeIdentityRuntime(),
         cache_path=cache,
         cache_metadata=second,
         is_target=True,
@@ -141,9 +165,11 @@ def _builder_landmarks() -> dict[int, tuple[float, float]]:
         13: (100.0, 112.0),
         14: (100.0, 120.0),
         33: (70.0, 70.0),
+        133: (90.0, 70.0),
         61: (82.0, 118.0),
         152: (100.0, 150.0),
         234: (55.0, 100.0),
+        362: (110.0, 70.0),
         263: (130.0, 70.0),
         291: (118.0, 118.0),
         454: (145.0, 100.0),
@@ -164,6 +190,7 @@ def _valid_observation(frame_idx: int):
         mouth_blur=100.0,
         mouth_open=0.2,
         landmark_valid=True,
+        identity_embedding=np.eye(1, 512, 0, dtype=np.float32)[0],
     )
 
 
@@ -209,6 +236,49 @@ def test_build_pair_decisions_uses_exact_precomputed_bnf_row() -> None:
     assert len(result.rows) == 1
     assert result.rows[0]["audio_idx"] == 0
     assert np.array_equal(result.rows[0]["audio"], bnf[0])
+
+
+def test_observation_cache_roundtrips_identity_embedding() -> None:
+    from edge_lipsync.silent_talking_dataset import observation_from_json, observation_to_json
+
+    original = _valid_observation(3)
+
+    restored = observation_from_json(observation_to_json(original))
+
+    assert restored.identity_embedding is not None
+    assert original.identity_embedding is not None
+    assert restored.identity_embedding.dtype == np.float32
+    assert np.array_equal(restored.identity_embedding, original.identity_embedding)
+
+
+def test_build_pair_decisions_reports_identity_mismatch() -> None:
+    from dataclasses import replace
+
+    from edge_lipsync.silent_talking_dataset import build_pair_decisions, quality_report
+
+    wrong_identity = np.eye(1, 512, 1, dtype=np.float32)[0]
+    result = build_pair_decisions(
+        talking_observations=[_valid_observation(1)],
+        silent_observations=[
+            replace(_valid_observation(7), identity_embedding=wrong_identity),
+        ],
+        bnf_windows=np.zeros((1, 20, 256), dtype=np.float32),
+        audio_rms=np.ones(1, dtype=np.float32),
+        config=_test_config(),
+        split_for_frame=lambda _frame_idx: "train",
+    )
+    report = quality_report(
+        clip_id="talk",
+        talking_observations=[_valid_observation(1)],
+        decisions=result.decisions,
+        rows=result.rows,
+    )
+
+    assert result.rows == []
+    assert result.decisions[0]["reject_reason"] == "identity_mismatch"
+    assert result.decisions[0]["identity_mismatch_candidate_count"] == 1
+    assert result.decisions[0]["identity_max_rejected_similarity"] == pytest.approx(0.0)
+    assert report["identity_mismatch_count"] == 1
 
 
 def test_build_pair_decisions_records_every_talking_frame() -> None:
@@ -272,7 +342,7 @@ def _complete_row(split: str) -> dict[str, object]:
     ok, encoded = cv2.imencode(".png", image)
     assert ok
     return {
-        "schema_version": "edge_lipsync_silent_talking_pair_v1",
+        "schema_version": "edge_lipsync_silent_talking_pair_v2",
         "persona_id": "nora",
         "pair_id": f"{split}-pair",
         "talking_clip_id": f"{split}-clip",
@@ -302,6 +372,7 @@ def _complete_row(split: str) -> dict[str, object]:
         "height_ratio": 1.0,
         "stable_landmark_alignment_rmse": 0.0,
         "mouth_center_delta_after_crop": 0.0,
+        "identity_similarity": 0.9,
         "matching_score": 0.0,
         "valid_silent_candidate_count": 1,
         "second_best_matching_score": None,
@@ -366,6 +437,12 @@ def test_build_silent_talking_dataset_writes_complete_snapshot(
             "val_rows": 1,
             "talking_clips": 1,
             "failed_clips": [],
+            "identity": {
+                "source": "local",
+                "sha256": "arcface-sha",
+                "license": "insightface-non-commercial-research",
+                "min_cosine_similarity": 0.35,
+            },
             "dataset_fingerprints": {
                 split: str(value._fingerprint) for split, value in dataset.items()
             },
@@ -390,6 +467,9 @@ def test_build_silent_talking_dataset_writes_complete_snapshot(
     assert (snapshot / "reports/quality/talk_frame_decisions.parquet").is_file()
     assert (snapshot / "build_metadata.json").is_file()
     assert (snapshot / "build_complete.json").is_file()
+    metadata = json.loads((snapshot / "build_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["identity"]["sha256"] == "arcface-sha"
+    assert metadata["identity"]["license"] == "insightface-non-commercial-research"
 
 
 def test_build_config_from_mapping_maps_nested_thresholds() -> None:
@@ -404,6 +484,10 @@ def test_build_config_from_mapping_maps_nested_thresholds() -> None:
             "wenet_onnx": "wenet.onnx",
             "matching": {"max_yaw_delta": 7.0},
             "post_crop_alignment": {"max_mouth_center_delta": 0.02},
+            "identity": {
+                "arcface_onnx": "/models/arcface.onnx",
+                "min_cosine_similarity": 0.42,
+            },
             "blur": {"min_target_mouth_laplacian_variance": 55.0},
             "sync": {"max_reject_lag_frames": 1},
         }
@@ -411,8 +495,31 @@ def test_build_config_from_mapping_maps_nested_thresholds() -> None:
 
     assert config.match.max_yaw_delta == pytest.approx(7.0)
     assert config.match.max_mouth_center_delta == pytest.approx(0.02)
+    assert config.identity.arcface_onnx == "/models/arcface.onnx"
+    assert config.identity.min_cosine_similarity == pytest.approx(0.42)
     assert config.blur.min_target_mouth_laplacian_variance == pytest.approx(55.0)
     assert config.sync.max_reject_lag_frames == 1
+
+
+def test_preview_rows_include_near_identity_threshold() -> None:
+    from edge_lipsync.silent_talking_dataset import _preview_rows
+
+    rows = [
+        {**_complete_row("train"), "pair_id": "high", "identity_similarity": 0.9},
+        {**_complete_row("train"), "pair_id": "near", "identity_similarity": 0.36},
+    ]
+
+    previews = _preview_rows(rows, count=1)
+
+    assert previews["near_identity_threshold"][0]["pair_id"] == "near"
+
+
+def test_identity_runtime_errors_are_always_fatal() -> None:
+    from edge_lipsync.identity import IdentityRuntimeError
+    from edge_lipsync.silent_talking_dataset import _clip_failure_is_fatal
+
+    assert _clip_failure_is_fatal(IdentityRuntimeError("onnx failed")) is True
+    assert _clip_failure_is_fatal(ValueError("bad clip")) is False
 
 
 def test_build_silent_talking_dataset_cli_help() -> None:
