@@ -522,6 +522,161 @@ def test_identity_runtime_errors_are_always_fatal() -> None:
     assert _clip_failure_is_fatal(ValueError("bad clip")) is False
 
 
+def test_cached_normalize_talking_video_reuses_valid_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.silent_talking_dataset as builder
+
+    source = tmp_path / "talk.mp4"
+    source.write_bytes(b"source")
+    video_out = tmp_path / "normalized/video.mkv"
+    audio_out = tmp_path / "normalized/audio.wav"
+    calls = 0
+
+    def fake_normalize(
+        _source: Path,
+        video_path: Path,
+        audio_path: Path,
+        *,
+        fps: int,
+    ) -> tuple[Path, Path]:
+        nonlocal calls
+        calls += 1
+        assert fps == 25
+        video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_path.write_bytes(b"video")
+        audio_path.write_bytes(b"audio")
+        return video_path, audio_path
+
+    monkeypatch.setattr(builder, "normalize_talking_video", fake_normalize)
+
+    first = builder.cached_normalize_talking_video(
+        source,
+        video_out,
+        audio_out,
+        fps=25,
+        sample_rate=16000,
+    )
+    second = builder.cached_normalize_talking_video(
+        source,
+        video_out,
+        audio_out,
+        fps=25,
+        sample_rate=16000,
+    )
+
+    assert first.hit is False
+    assert second.hit is True
+    assert second.value == (video_out, audio_out)
+    assert calls == 1
+
+
+def test_cached_extract_frames_rebuilds_incomplete_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.silent_talking_dataset as builder
+
+    video = tmp_path / "video.mkv"
+    video.write_bytes(b"video")
+    frames = tmp_path / "frames"
+    calls = 0
+
+    def fake_extract(
+        _video: Path,
+        output: Path,
+        **_kwargs: object,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        output.mkdir(parents=True, exist_ok=True)
+        for frame_idx in (1, 2):
+            cv2.imwrite(
+                str(output / f"{frame_idx:06d}.png"),
+                np.full((8, 8, 3), frame_idx, dtype=np.uint8),
+            )
+        return 2
+
+    monkeypatch.setattr(builder, "extract_frames", fake_extract)
+
+    first = builder.cached_extract_frames(video, frames, show_progress=False)
+    second = builder.cached_extract_frames(video, frames, show_progress=False)
+    (frames / "000002.png").unlink()
+    third = builder.cached_extract_frames(video, frames, show_progress=False)
+
+    assert (first.hit, second.hit, third.hit) == (False, True, False)
+    assert calls == 2
+
+
+def test_cached_bnf_windows_reuses_valid_array_and_invalidates_model(
+    tmp_path: Path,
+) -> None:
+    import edge_lipsync.silent_talking_dataset as builder
+
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"audio")
+    cache = tmp_path / "bnf.npy"
+
+    class FakeWenet:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def extract_wav(self, _path: Path) -> np.ndarray:
+            self.calls += 1
+            return np.full((3, 20, 256), self.calls, dtype=np.float32)
+
+    wenet = FakeWenet()
+    first = builder.cached_bnf_windows(
+        audio,
+        cache,
+        wenet,
+        wenet_sha256="model-a",
+        sample_rate=16000,
+    )
+    second = builder.cached_bnf_windows(
+        audio,
+        cache,
+        wenet,
+        wenet_sha256="model-a",
+        sample_rate=16000,
+    )
+    third = builder.cached_bnf_windows(
+        audio,
+        cache,
+        wenet,
+        wenet_sha256="model-b",
+        sample_rate=16000,
+    )
+
+    assert (first.hit, second.hit, third.hit) == (False, True, False)
+    assert wenet.calls == 2
+    assert np.all(second.value == 1.0)
+    assert np.all(third.value == 2.0)
+
+
+def test_analysis_cache_metadata_uses_only_analysis_inputs(tmp_path: Path) -> None:
+    from edge_lipsync.silent_talking_dataset import analysis_cache_metadata
+
+    video = tmp_path / "video.mp4"
+    landmark = tmp_path / "face_landmarker.task"
+    video.write_bytes(b"video")
+    landmark.write_bytes(b"landmark")
+
+    metadata = analysis_cache_metadata(
+        video,
+        frame_count=25,
+        landmark_model_path=landmark,
+        identity_sha256="arcface-sha",
+    )
+
+    assert metadata["input"]["sha256"]
+    assert metadata["landmark_model"]["sha256"]
+    assert metadata["identity_sha256"] == "arcface-sha"
+    assert "snapshot_root" not in metadata
+    assert "preview_count_per_group" not in metadata
+
+
 def test_build_silent_talking_dataset_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/build_silent_talking_dataset.py", "--help"],

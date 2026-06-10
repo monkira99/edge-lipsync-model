@@ -8,14 +8,14 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 import cv2
 import numpy as np
 from datasets import Array2D, Dataset, DatasetDict, Features, Image, Sequence, Value
 
 from edge_lipsync.audio_features import (
-    extract_bnf_windows_from_wav,
+    WenetRuntime,
     load_wav_mono_f32,
     split_audio_blocks,
 )
@@ -53,6 +53,11 @@ from edge_lipsync.preprocess import ROI_SOURCE_SIZE, BBox, landmarks_to_duix_roi
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv"}
 SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v2"
+NORMALIZE_CACHE_VERSION = 1
+FRAME_CACHE_VERSION = 1
+ANALYSIS_CACHE_VERSION = 2
+BNF_CACHE_VERSION = 1
+CacheValue = TypeVar("CacheValue")
 
 SILENT_TALKING_FEATURES = Features(
     {
@@ -115,6 +120,16 @@ class IdentityRuntime(Protocol):
         frame_bgr: np.ndarray,
         landmarks: Mapping[int, tuple[float, float]],
     ) -> np.ndarray: ...
+
+
+class WenetExtractor(Protocol):
+    def extract_wav(self, wav_path: str | Path) -> np.ndarray: ...
+
+
+@dataclass(frozen=True)
+class CacheOutcome(Generic[CacheValue]):
+    value: CacheValue
+    hit: bool
 
 
 @dataclass(frozen=True)
@@ -267,6 +282,199 @@ def normalize_talking_video(
         ]
     )
     return video_out, audio_out
+
+
+def _read_matching_metadata(path: Path, expected: dict[str, Any]) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) == expected
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _nonempty_file(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def cached_normalize_visual_video(
+    src: Path,
+    out: Path,
+    *,
+    fps: int,
+) -> CacheOutcome[Path]:
+    metadata_path = out.parent / "normalize.meta.json"
+    metadata = {
+        "stage_version": NORMALIZE_CACHE_VERSION,
+        "input": file_identity(src),
+        "fps": fps,
+        "audio": False,
+    }
+    if _read_matching_metadata(metadata_path, metadata) and _nonempty_file(out):
+        return CacheOutcome(out, True)
+    temporary = out.with_name(f"{out.stem}.building{out.suffix}")
+    temporary.unlink(missing_ok=True)
+    normalize_visual_video(src, temporary, fps=fps)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temporary.replace(out)
+    write_json_atomic(metadata_path, metadata)
+    return CacheOutcome(out, False)
+
+
+def cached_normalize_talking_video(
+    src: Path,
+    video_out: Path,
+    audio_out: Path,
+    *,
+    fps: int,
+    sample_rate: int,
+) -> CacheOutcome[tuple[Path, Path]]:
+    metadata_path = video_out.parent / "normalize.meta.json"
+    metadata = {
+        "stage_version": NORMALIZE_CACHE_VERSION,
+        "input": file_identity(src),
+        "fps": fps,
+        "sample_rate": sample_rate,
+        "audio": True,
+    }
+    if (
+        _read_matching_metadata(metadata_path, metadata)
+        and _nonempty_file(video_out)
+        and _nonempty_file(audio_out)
+    ):
+        return CacheOutcome((video_out, audio_out), True)
+    temporary_video = video_out.with_name(
+        f"{video_out.stem}.building{video_out.suffix}"
+    )
+    temporary_audio = audio_out.with_name(
+        f"{audio_out.stem}.building{audio_out.suffix}"
+    )
+    temporary_video.unlink(missing_ok=True)
+    temporary_audio.unlink(missing_ok=True)
+    normalize_talking_video(
+        src,
+        temporary_video,
+        temporary_audio,
+        fps=fps,
+    )
+    video_out.parent.mkdir(parents=True, exist_ok=True)
+    temporary_video.replace(video_out)
+    temporary_audio.replace(audio_out)
+    write_json_atomic(metadata_path, metadata)
+    return CacheOutcome((video_out, audio_out), False)
+
+
+def _frame_cache_valid(frames_dir: Path, frame_count: int) -> bool:
+    if frame_count <= 0 or not frames_dir.is_dir():
+        return False
+    return all(
+        _nonempty_file(frames_dir / f"{frame_idx:06d}{FRAME_SUFFIX}")
+        for frame_idx in range(1, frame_count + 1)
+    )
+
+
+def cached_extract_frames(
+    video_path: Path,
+    frames_dir: Path,
+    *,
+    show_progress: bool = True,
+    progress_desc: str = "extract frames",
+) -> CacheOutcome[int]:
+    metadata_path = frames_dir.with_suffix(".meta.json")
+    base_metadata = {
+        "stage_version": FRAME_CACHE_VERSION,
+        "input": file_identity(video_path),
+    }
+    if metadata_path.is_file():
+        try:
+            stored = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            stored = {}
+        frame_count = int(stored.get("frame_count", 0))
+        expected = {**base_metadata, "frame_count": frame_count}
+        if stored == expected and _frame_cache_valid(frames_dir, frame_count):
+            return CacheOutcome(frame_count, True)
+    temporary = frames_dir.with_name(frames_dir.name + ".building")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    frame_count = extract_frames(
+        video_path,
+        temporary,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
+    )
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    temporary.replace(frames_dir)
+    write_json_atomic(metadata_path, {**base_metadata, "frame_count": frame_count})
+    return CacheOutcome(frame_count, False)
+
+
+def _valid_bnf_windows(value: np.ndarray) -> bool:
+    return bool(
+        value.ndim == 3
+        and value.shape[0] > 0
+        and value.shape[1:] == (20, 256)
+        and value.dtype == np.float32
+        and np.isfinite(value).all()
+    )
+
+
+def cached_bnf_windows(
+    audio_path: Path,
+    cache_path: Path,
+    wenet_runtime: WenetExtractor,
+    *,
+    wenet_sha256: str,
+    sample_rate: int,
+) -> CacheOutcome[np.ndarray]:
+    metadata_path = cache_path.with_suffix(".meta.json")
+    metadata = {
+        "stage_version": BNF_CACHE_VERSION,
+        "audio": file_identity(audio_path),
+        "wenet_sha256": wenet_sha256,
+        "sample_rate": sample_rate,
+    }
+    if _read_matching_metadata(metadata_path, metadata) and cache_path.is_file():
+        try:
+            cached = np.load(cache_path, allow_pickle=False)
+        except (OSError, ValueError):
+            cached = np.asarray([], dtype=np.float32)
+        if _valid_bnf_windows(cached):
+            return CacheOutcome(np.ascontiguousarray(cached), True)
+    value = np.ascontiguousarray(
+        wenet_runtime.extract_wav(audio_path),
+        dtype=np.float32,
+    )
+    if not _valid_bnf_windows(value):
+        raise ValueError(f"Invalid Wenet BNF cache value: shape={value.shape}")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_path.with_name(cache_path.stem + ".building.npy")
+    with temporary.open("wb") as output:
+        np.save(output, value, allow_pickle=False)
+    temporary.replace(cache_path)
+    write_json_atomic(metadata_path, metadata)
+    return CacheOutcome(value, False)
+
+
+def analysis_cache_metadata(
+    input_path: Path,
+    *,
+    frame_count: int,
+    landmark_model_path: Path | None,
+    identity_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "stage_version": ANALYSIS_CACHE_VERSION,
+        "input": file_identity(input_path),
+        "frame_count": frame_count,
+        "landmark_model": (
+            file_identity(landmark_model_path)
+            if landmark_model_path is not None
+            else None
+        ),
+        "identity_sha256": identity_sha256,
+    }
 
 
 def observation_to_json(observation: FrameObservation) -> dict[str, Any]:
@@ -1226,22 +1434,28 @@ def _build_snapshot_contents(
     config: SilentTalkingBuildConfig,
     temporary_root: Path,
 ) -> dict[str, Any]:
-    cfg_hash = config_sha256(config)
     work_root = Path(config.work_root) / config.persona_id
     identity_runtime, identity_provenance = create_identity_runtime(config.identity)
+    wenet_runtime = WenetRuntime(config.wenet_onnx)
+    wenet_identity = file_identity(Path(config.wenet_onnx))
+    landmark_model = (
+        Path(config.landmark_model_asset_path)
+        if config.landmark_model_asset_path
+        else None
+    )
     silent_work = work_root / "normalized" / "silent"
-    silent_video = normalize_visual_video(
+    silent_video = cached_normalize_visual_video(
         config.silent_video_path,
         silent_work / "video_25fps.mkv",
         fps=config.fps,
-    )
+    ).value
     silent_frames_dir = silent_work / "frames"
-    silent_frame_count = extract_frames(
+    silent_frame_count = cached_extract_frames(
         silent_video,
         silent_frames_dir,
         show_progress=config.progress,
         progress_desc="extract silent",
-    )
+    ).value
     silent_detector = _create_detector(config)
     try:
         silent_observations = analyze_frames(
@@ -1250,11 +1464,12 @@ def _build_snapshot_contents(
             detector=silent_detector,
             identity_runtime=identity_runtime,
             cache_path=work_root / "analysis" / "silent" / "analysis.jsonl",
-            cache_metadata={
-                "config_sha256": cfg_hash,
-                "input": file_identity(config.silent_video_path),
-                "frame_count": silent_frame_count,
-            },
+            cache_metadata=analysis_cache_metadata(
+                config.silent_video_path,
+                frame_count=silent_frame_count,
+                landmark_model_path=landmark_model,
+                identity_sha256=str(identity_provenance["sha256"]),
+            ),
             is_target=False,
             show_progress=config.progress,
         )
@@ -1294,20 +1509,27 @@ def _build_snapshot_contents(
         clip_id = video.stem
         clip_work = work_root / "normalized" / "talking" / clip_id
         try:
-            normalized_video, audio_path = normalize_talking_video(
+            normalized_video, audio_path = cached_normalize_talking_video(
                 video,
                 clip_work / "video_25fps.mkv",
                 clip_work / "audio.wav",
                 fps=config.fps,
-            )
+                sample_rate=config.sample_rate,
+            ).value
             frames_dir = clip_work / "frames"
-            frame_count = extract_frames(
+            frame_count = cached_extract_frames(
                 normalized_video,
                 frames_dir,
                 show_progress=config.progress,
                 progress_desc=f"extract {clip_id}",
-            )
-            bnf_windows = extract_bnf_windows_from_wav(audio_path, config.wenet_onnx)
+            ).value
+            bnf_windows = cached_bnf_windows(
+                audio_path,
+                work_root / "bnf" / clip_id / "windows.npy",
+                wenet_runtime,
+                wenet_sha256=str(wenet_identity["sha256"]),
+                sample_rate=config.sample_rate,
+            ).value
             audio_rms = _frame_aligned_rms(audio_path, frame_count)
             talking_detector = _create_detector(config)
             try:
@@ -1317,11 +1539,12 @@ def _build_snapshot_contents(
                     detector=talking_detector,
                     identity_runtime=identity_runtime,
                     cache_path=work_root / "analysis" / "talking" / clip_id / "analysis.jsonl",
-                    cache_metadata={
-                        "config_sha256": cfg_hash,
-                        "input": file_identity(video),
-                        "frame_count": frame_count,
-                    },
+                    cache_metadata=analysis_cache_metadata(
+                        video,
+                        frame_count=frame_count,
+                        landmark_model_path=landmark_model,
+                        identity_sha256=str(identity_provenance["sha256"]),
+                    ),
                     is_target=True,
                     show_progress=config.progress,
                 )
