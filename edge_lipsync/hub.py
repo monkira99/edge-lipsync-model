@@ -52,6 +52,11 @@ MODEL_ASSET_REQUIRED_PATHS = (
     "mediapipe/face_landmarker.task",
     "wenet/wenet.onnx",
 )
+DATASET_TRAIN_TRANSFER_PATTERNS = [
+    "dataset/**",
+    "build_complete.json",
+    "build_metadata.json",
+]
 
 @dataclass(frozen=True)
 class HubArtifact:
@@ -205,8 +210,13 @@ def push_dataset_snapshot(
     *,
     private: bool = True,
     commit_message: str = "Upload pose-paired dataset snapshot",
+    include_reports: bool = False,
+    workers: int = 8,
     api: Any | None = None,
 ) -> HubArtifact:
+    del commit_message
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
     root = Path(snapshot_root)
     if not (root / "build_complete.json").is_file():
         raise FileNotFoundError(root / "build_complete.json")
@@ -214,13 +224,16 @@ def push_dataset_snapshot(
         raise FileNotFoundError(root / "dataset/dataset_dict.json")
     client = _client(api)
     client.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
-    commit = client.upload_folder(
-        folder_path=str(root),
-        repo_id=repo_id,
-        repo_type="dataset",
-        commit_message=commit_message,
-    )
-    ref = str(commit.oid)
+    upload_kwargs: dict[str, Any] = {
+        "folder_path": str(root),
+        "repo_id": repo_id,
+        "repo_type": "dataset",
+        "num_workers": workers,
+    }
+    if not include_reports:
+        upload_kwargs["allow_patterns"] = DATASET_TRAIN_TRANSFER_PATTERNS
+    client.upload_large_folder(**upload_kwargs)
+    ref = str(client.dataset_info(repo_id=repo_id).sha)
     return HubArtifact(
         repo_id=repo_id,
         requested_ref=ref,
@@ -235,11 +248,16 @@ def pull_dataset_snapshot(
     ref: str,
     local_dir: str,
     cache_dir: str = "",
+    include_reports: bool = False,
+    workers: int = 16,
     api: Any | None = None,
     verify: Callable[[Path], dict[str, str]],
 ) -> HubArtifact:
     if not ref:
         raise ValueError("Dataset snapshot revision is required")
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+    download_profile = "full" if include_reports else "train-only"
     root = Path(local_dir)
     marker_path = root / ".snapshot_complete.json"
     if marker_path.is_file():
@@ -249,10 +267,15 @@ def pull_dataset_snapshot(
         except Exception:
             marker = {}
             fingerprints = {}
+        marker_profile = marker.get("download_profile", "full")
         if (
             marker.get("repo_id") == repo_id
             and marker.get("resolved_ref") == ref
             and marker.get("dataset_fingerprints") == fingerprints
+            and (
+                marker_profile == "full"
+                or marker_profile == download_profile
+            )
         ):
             return HubArtifact(
                 repo_id=repo_id,
@@ -266,7 +289,10 @@ def pull_dataset_snapshot(
         "repo_type": "dataset",
         "revision": ref,
         "local_dir": str(root),
+        "max_workers": workers,
     }
+    if not include_reports:
+        kwargs["allow_patterns"] = DATASET_TRAIN_TRANSFER_PATTERNS
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
     downloaded = Path(snapshot_download(**kwargs))
@@ -280,6 +306,7 @@ def pull_dataset_snapshot(
         "requested_ref": ref,
         "resolved_ref": resolved,
         "dataset_fingerprints": fingerprints,
+        "download_profile": download_profile,
     }
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = marker_path.with_suffix(".tmp")

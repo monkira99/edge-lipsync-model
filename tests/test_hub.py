@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import runpy
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -197,20 +199,116 @@ def test_pull_model_assets_downloads_snapshot_to_local_dir(
     ]
 
 
-def test_push_dataset_snapshot_uploads_complete_package(tmp_path: Path) -> None:
-    from edge_lipsync.hub import push_dataset_snapshot
-
-    snapshot = tmp_path / "snapshot"
+def _write_dataset_snapshot(root: Path) -> Path:
+    snapshot = root / "snapshot"
     (snapshot / "dataset").mkdir(parents=True)
     (snapshot / "dataset/dataset_dict.json").write_text("{}", encoding="utf-8")
     (snapshot / "build_complete.json").write_text("{}", encoding="utf-8")
-    api = _FakeApi()
+    (snapshot / "build_metadata.json").write_text("{}", encoding="utf-8")
+    (snapshot / "reports/previews").mkdir(parents=True)
+    (snapshot / "reports/previews/sample.png").write_bytes(b"preview")
+    return snapshot
+
+
+def test_push_dataset_snapshot_uses_resumable_train_only_upload(tmp_path: Path) -> None:
+    from edge_lipsync.hub import DATASET_TRAIN_TRANSFER_PATTERNS, push_dataset_snapshot
+
+    snapshot = _write_dataset_snapshot(tmp_path)
+    api = _FakeApi(dataset_sha="full-commit-sha")
+
+    artifact = push_dataset_snapshot(
+        snapshot,
+        "owner/nora-pairs",
+        workers=8,
+        api=api,
+    )
+
+    assert artifact.resolved_ref == "full-commit-sha"
+    assert api.created[-1]["repo_type"] == "dataset"
+    assert api.upload_calls == []
+    assert api.large_uploads == [
+        {
+            "folder_path": str(snapshot),
+            "repo_id": "owner/nora-pairs",
+            "repo_type": "dataset",
+            "allow_patterns": DATASET_TRAIN_TRANSFER_PATTERNS,
+            "num_workers": 8,
+        }
+    ]
+
+
+def test_push_dataset_snapshot_can_include_reports(tmp_path: Path) -> None:
+    from edge_lipsync.hub import push_dataset_snapshot
+
+    snapshot = _write_dataset_snapshot(tmp_path)
+    api = _FakeApi(dataset_sha="full-commit-sha")
+
+    push_dataset_snapshot(
+        snapshot,
+        "owner/nora-pairs",
+        include_reports=True,
+        workers=3,
+        api=api,
+    )
+
+    assert api.large_uploads == [
+        {
+            "folder_path": str(snapshot),
+            "repo_id": "owner/nora-pairs",
+            "repo_type": "dataset",
+            "num_workers": 3,
+        }
+    ]
+
+
+def test_push_dataset_snapshot_can_retry_same_folder_after_interruption(
+    tmp_path: Path,
+) -> None:
+    from edge_lipsync.hub import push_dataset_snapshot
+
+    class InterruptOnceApi(_FakeApi):
+        def __init__(self) -> None:
+            super().__init__(dataset_sha="full-commit-sha")
+            self.attempts = 0
+
+        def upload_large_folder(self, **kwargs: Any) -> None:
+            self.large_uploads.append(kwargs)
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("upload interrupted")
+
+    snapshot = _write_dataset_snapshot(tmp_path)
+    api = InterruptOnceApi()
+
+    with pytest.raises(ConnectionError, match="upload interrupted"):
+        push_dataset_snapshot(snapshot, "owner/nora-pairs", api=api)
 
     artifact = push_dataset_snapshot(snapshot, "owner/nora-pairs", api=api)
 
-    assert artifact.resolved_ref == "dataset-commit"
-    assert api.created[-1]["repo_type"] == "dataset"
-    assert api.upload_calls[-1]["repo_type"] == "dataset"
+    assert artifact.resolved_ref == "full-commit-sha"
+    assert len(api.large_uploads) == 2
+    assert snapshot.is_dir()
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_dataset_snapshot_transfer_rejects_invalid_worker_count(
+    tmp_path: Path,
+    workers: int,
+) -> None:
+    from edge_lipsync.hub import pull_dataset_snapshot, push_dataset_snapshot
+
+    snapshot = _write_dataset_snapshot(tmp_path)
+    with pytest.raises(ValueError, match="workers"):
+        push_dataset_snapshot(snapshot, "owner/nora-pairs", workers=workers, api=_FakeApi())
+    with pytest.raises(ValueError, match="workers"):
+        pull_dataset_snapshot(
+            "owner/nora-pairs",
+            ref="full-sha",
+            local_dir=str(tmp_path / "downloaded"),
+            workers=workers,
+            api=_FakeApi(dataset_sha="full-sha"),
+            verify=lambda _path: {},
+        )
 
 
 def test_pull_dataset_snapshot_writes_verified_local_marker(
@@ -226,7 +324,143 @@ def test_pull_dataset_snapshot_writes_verified_local_marker(
         json.dumps({"dataset_fingerprints": {"train": "a", "val": "b"}}),
         encoding="utf-8",
     )
-    monkeypatch.setattr(hub, "snapshot_download", lambda **_kwargs: str(downloaded))
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return str(downloaded)
+
+    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
+
+    artifact = hub.pull_dataset_snapshot(
+        "owner/nora-pairs",
+        ref="full-sha",
+        local_dir=str(downloaded),
+        workers=16,
+        api=_FakeApi(dataset_sha="full-sha"),
+        verify=lambda _path: {"train": "a", "val": "b"},
+    )
+
+    marker = json.loads((downloaded / ".snapshot_complete.json").read_text())
+    assert artifact.path == downloaded
+    assert marker["repo_id"] == "owner/nora-pairs"
+    assert marker["resolved_ref"] == "full-sha"
+    assert marker["download_profile"] == "train-only"
+    assert calls == [
+        {
+            "repo_id": "owner/nora-pairs",
+            "repo_type": "dataset",
+            "revision": "full-sha",
+            "local_dir": str(downloaded),
+            "allow_patterns": hub.DATASET_TRAIN_TRANSFER_PATTERNS,
+            "max_workers": 16,
+        }
+    ]
+
+
+def test_pull_dataset_snapshot_full_profile_downloads_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.hub as hub
+
+    downloaded = tmp_path / "downloaded"
+    downloaded.mkdir()
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return str(downloaded)
+
+    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
+
+    hub.pull_dataset_snapshot(
+        "owner/nora-pairs",
+        ref="full-sha",
+        local_dir=str(downloaded),
+        include_reports=True,
+        workers=6,
+        api=_FakeApi(dataset_sha="full-sha"),
+        verify=lambda _path: {"train": "a", "val": "b"},
+    )
+
+    marker = json.loads((downloaded / ".snapshot_complete.json").read_text())
+    assert marker["download_profile"] == "full"
+    assert calls == [
+        {
+            "repo_id": "owner/nora-pairs",
+            "repo_type": "dataset",
+            "revision": "full-sha",
+            "local_dir": str(downloaded),
+            "max_workers": 6,
+        }
+    ]
+
+
+def test_pull_dataset_snapshot_train_only_marker_does_not_satisfy_full_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.hub as hub
+
+    downloaded = tmp_path / "downloaded"
+    downloaded.mkdir()
+    (downloaded / ".snapshot_complete.json").write_text(
+        json.dumps(
+            {
+                "repo_id": "owner/nora-pairs",
+                "resolved_ref": "full-sha",
+                "dataset_fingerprints": {"train": "a", "val": "b"},
+                "download_profile": "train-only",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, Any]] = []
+
+    def fake_snapshot_download(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return str(downloaded)
+
+    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
+
+    hub.pull_dataset_snapshot(
+        "owner/nora-pairs",
+        ref="full-sha",
+        local_dir=str(downloaded),
+        include_reports=True,
+        api=_FakeApi(dataset_sha="full-sha"),
+        verify=lambda _path: {"train": "a", "val": "b"},
+    )
+
+    assert len(calls) == 1
+
+
+def test_pull_dataset_snapshot_full_marker_satisfies_train_only_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.hub as hub
+
+    downloaded = tmp_path / "downloaded"
+    downloaded.mkdir()
+    (downloaded / ".snapshot_complete.json").write_text(
+        json.dumps(
+            {
+                "repo_id": "owner/nora-pairs",
+                "resolved_ref": "full-sha",
+                "dataset_fingerprints": {"train": "a", "val": "b"},
+                "download_profile": "full",
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        hub,
+        "snapshot_download",
+        lambda **kwargs: calls.append(kwargs) or str(downloaded),
+    )
 
     artifact = hub.pull_dataset_snapshot(
         "owner/nora-pairs",
@@ -236,10 +470,31 @@ def test_pull_dataset_snapshot_writes_verified_local_marker(
         verify=lambda _path: {"train": "a", "val": "b"},
     )
 
-    marker = json.loads((downloaded / ".snapshot_complete.json").read_text())
     assert artifact.path == downloaded
-    assert marker["repo_id"] == "owner/nora-pairs"
-    assert marker["resolved_ref"] == "full-sha"
+    assert calls == []
+
+
+def test_hf_dataset_cli_enables_xet_high_performance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HF_XET_HIGH_PERFORMANCE", raising=False)
+
+    runpy.run_path("tools/hf_dataset.py", run_name="hf_dataset_test")
+
+    assert os.environ["HF_XET_HIGH_PERFORMANCE"] == "1"
+
+
+@pytest.mark.parametrize("command", ["push-snapshot", "pull-snapshot"])
+def test_hf_dataset_snapshot_cli_exposes_transfer_options(command: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "tools/hf_dataset.py", command, "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--workers" in result.stdout
+    assert "--include-reports" in result.stdout
 
 
 @pytest.mark.parametrize(

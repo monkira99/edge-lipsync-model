@@ -142,19 +142,28 @@ Hub is transport only for these snapshots. Upload the complete saved directory, 
 commit SHA, then download that immutable revision once on the training machine:
 
 ```bash
-.venv/bin/python tools/hf_dataset.py push-snapshot \
+HF_XET_HIGH_PERFORMANCE=1 uv run python tools/hf_dataset.py push-snapshot \
   --snapshot-root /absolute/path/to/datasets/nora_pose_pairs \
-  --repo-id username/nora-pose-pairs
+  --repo-id username/nora-pose-pairs \
+  --workers 8
 
-.venv/bin/python tools/hf_dataset.py pull-snapshot \
+HF_XET_HIGH_PERFORMANCE=1 uv run python tools/hf_dataset.py pull-snapshot \
   --repo-id username/nora-pose-pairs \
   --revision <full-commit-sha> \
-  --local-dir /persistent/datasets/nora/<full-commit-sha>
+  --local-dir /persistent/datasets/nora/<full-commit-sha> \
+  --cache-dir /persistent/hf-cache \
+  --workers 16
 ```
+
+Snapshot upload/download defaults to the train-ready package only:
+`dataset/**`, `build_complete.json`, and `build_metadata.json`. This avoids transferring thousands
+of quality-report and preview files. Add `--include-reports` to either command when the complete
+review artifact is required. Large-folder uploads are resumable; rerun the same command with the
+same snapshot root after an interruption.
 
 Training uses `datasets.load_from_disk(<local_snapshot>/dataset)`. The local
 `.snapshot_complete.json` marker prevents repeat Hub access after the requested repo, full commit
-SHA, and dataset fingerprints have been verified.
+SHA, dataset fingerprints, and download profile have been verified.
 
 ## Build Hugging Face Video Dataset
 

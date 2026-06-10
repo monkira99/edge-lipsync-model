@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import cast
+
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 from datasets import DatasetDict, load_from_disk
 
@@ -41,6 +44,8 @@ def main() -> None:
     push_snapshot.add_argument("--snapshot-root", required=True)
     push_snapshot.add_argument("--repo-id", required=True)
     push_snapshot.add_argument("--public", action="store_true")
+    push_snapshot.add_argument("--workers", type=int, default=8)
+    push_snapshot.add_argument("--include-reports", action="store_true")
 
     pull_snapshot = subparsers.add_parser(
         "pull-snapshot",
@@ -50,6 +55,8 @@ def main() -> None:
     pull_snapshot.add_argument("--revision", required=True)
     pull_snapshot.add_argument("--local-dir", required=True)
     pull_snapshot.add_argument("--cache-dir", default="")
+    pull_snapshot.add_argument("--workers", type=int, default=16)
+    pull_snapshot.add_argument("--include-reports", action="store_true")
 
     args = parser.parse_args()
     if args.command == "push":
@@ -78,6 +85,8 @@ def main() -> None:
             args.snapshot_root,
             args.repo_id,
             private=not args.public,
+            include_reports=args.include_reports,
+            workers=args.workers,
         )
         print(f"repo_id={artifact.repo_id}")
         print(f"revision={artifact.resolved_ref}")
@@ -88,6 +97,8 @@ def main() -> None:
             ref=args.revision,
             local_dir=args.local_dir,
             cache_dir=args.cache_dir,
+            include_reports=args.include_reports,
+            workers=args.workers,
             verify=_snapshot_fingerprints,
         )
         print(f"repo_id={artifact.repo_id}")
