@@ -12,6 +12,10 @@ CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 
 
+class OnnxRuntimeError(RuntimeError):
+    pass
+
+
 class OnnxRunExecutor(Protocol):
     def run(
         self,

@@ -141,7 +141,12 @@ def test_wenet_runtime_uses_shared_run_limiter(tmp_path: Path) -> None:
     _write_silent_wav(wav)
 
     class FakeSession:
-        def run(self, _output_names, _inputs):
+        def run(
+            self,
+            output_names: list[str],
+            inputs: dict[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            del output_names, inputs
             raise AssertionError("session.run must be delegated to the limiter")
 
     class FakeLimiter:

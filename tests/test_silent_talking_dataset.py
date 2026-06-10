@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -622,7 +625,8 @@ def test_cached_bnf_windows_reuses_valid_array_and_invalidates_model(
         def __init__(self) -> None:
             self.calls = 0
 
-        def extract_wav(self, _path: Path) -> np.ndarray:
+        def extract_wav(self, wav_path: str | Path) -> np.ndarray:
+            del wav_path
             self.calls += 1
             return np.full((3, 20, 256), self.calls, dtype=np.float32)
 
@@ -675,6 +679,147 @@ def test_analysis_cache_metadata_uses_only_analysis_inputs(tmp_path: Path) -> No
     assert metadata["identity_sha256"] == "arcface-sha"
     assert "snapshot_root" not in metadata
     assert "preview_count_per_group" not in metadata
+
+
+def test_build_config_from_mapping_maps_runtime_options() -> None:
+    from edge_lipsync.silent_talking_dataset import build_config_from_mapping
+
+    config = build_config_from_mapping(
+        {
+            "data_root": "data",
+            "persona_id": "nora",
+            "snapshot_root": "snapshot",
+            "work_root": "work",
+            "wenet_onnx": "wenet.onnx",
+            "runtime": {
+                "device": "cuda",
+                "clip_workers": 6,
+                "cuda_max_inflight": 3,
+                "warn_on_cpu_fallback": False,
+            },
+        }
+    )
+
+    assert config.runtime.device == "cuda"
+    assert config.runtime.clip_workers == 6
+    assert config.runtime.cuda_max_inflight == 3
+    assert config.runtime.warn_on_cpu_fallback is False
+
+
+def test_thread_local_detector_pool_reuses_per_thread_and_closes_all() -> None:
+    from edge_lipsync.silent_talking_dataset import ThreadLocalDetectorPool
+
+    created: list[Any] = []
+    barrier = threading.Barrier(2)
+
+    class FakeDetector:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def detect_landmarks(
+            self,
+            frame_bgr: np.ndarray,
+            /,
+        ) -> Mapping[int, tuple[float, float]] | None:
+            del frame_bgr
+            return None
+
+    def factory() -> FakeDetector:
+        detector = FakeDetector()
+        created.append(detector)
+        return detector
+
+    pool = ThreadLocalDetectorPool(factory)
+
+    def use_detector_twice() -> tuple[int, int]:
+        first = pool.get()
+        barrier.wait()
+        second = pool.get()
+        return id(first), id(second)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        identities = list(executor.map(lambda _index: use_detector_twice(), range(2)))
+    pool.close_all()
+
+    assert len(created) == 2
+    assert all(first == second for first, second in identities)
+    assert len({first for first, _second in identities}) == 2
+    assert all(detector.closed for detector in created)
+
+
+def test_run_clip_workers_processes_concurrently_and_sorts_results(
+    tmp_path: Path,
+) -> None:
+    from edge_lipsync.silent_talking_dataset import ClipBuildResult, run_clip_workers
+
+    videos = [tmp_path / name for name in ("c.mp4", "a.mp4", "b.mp4")]
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def worker(video: Path) -> ClipBuildResult:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return ClipBuildResult(clip_id=video.stem)
+
+    results, failures = run_clip_workers(
+        videos,
+        worker,
+        max_workers=2,
+        strict=True,
+    )
+
+    assert peak == 2
+    assert [result.clip_id for result in results] == ["a", "b", "c"]
+    assert failures == []
+
+
+def test_run_clip_workers_keeps_nonfatal_failures_when_not_strict(
+    tmp_path: Path,
+) -> None:
+    from edge_lipsync.silent_talking_dataset import ClipBuildResult, run_clip_workers
+
+    videos = [tmp_path / "good.mp4", tmp_path / "bad.mp4"]
+
+    def worker(video: Path) -> ClipBuildResult:
+        if video.stem == "bad":
+            raise ValueError("bad clip")
+        return ClipBuildResult(clip_id=video.stem)
+
+    results, failures = run_clip_workers(
+        videos,
+        worker,
+        max_workers=2,
+        strict=False,
+    )
+
+    assert [result.clip_id for result in results] == ["good"]
+    assert [failure.clip_id for failure in failures] == ["bad"]
+    assert isinstance(failures[0].error, ValueError)
+
+
+def test_run_clip_workers_re_raises_fatal_runtime_error(tmp_path: Path) -> None:
+    from edge_lipsync.identity import IdentityRuntimeError
+    from edge_lipsync.silent_talking_dataset import ClipBuildResult, run_clip_workers
+
+    def worker(video: Path) -> ClipBuildResult:
+        raise IdentityRuntimeError(video.stem)
+
+    with pytest.raises(IdentityRuntimeError):
+        run_clip_workers(
+            [tmp_path / "bad.mp4"],
+            worker,
+            max_workers=1,
+            strict=False,
+        )
 
 
 def test_build_silent_talking_dataset_cli_help() -> None:

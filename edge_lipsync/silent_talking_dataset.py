@@ -4,10 +4,13 @@ import hashlib
 import json
 import math
 import shutil
+import threading
 from collections import Counter
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Generic, Protocol, TypeVar, cast
 
 import cv2
@@ -27,6 +30,11 @@ from edge_lipsync.identity import (
     create_identity_runtime,
 )
 from edge_lipsync.landmarks import MediaPipeFaceLandmarkerDetector
+from edge_lipsync.onnx_runtime import (
+    OnnxRunLimiter,
+    OnnxRuntimeError,
+    resolve_onnx_providers,
+)
 from edge_lipsync.pose_pairing import (
     TRACKED_LANDMARK_INDICES,
     FrameObservation,
@@ -151,6 +159,14 @@ class SyncConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    device: str = "auto"
+    clip_workers: int = 4
+    cuda_max_inflight: int = 2
+    warn_on_cpu_fallback: bool = True
+
+
+@dataclass(frozen=True)
 class SilentTalkingBuildConfig:
     data_root: str
     persona_id: str
@@ -171,6 +187,7 @@ class SilentTalkingBuildConfig:
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     blur: BlurConfig = field(default_factory=BlurConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @property
     def persona_root(self) -> Path:
@@ -192,6 +209,22 @@ class PairDecisionResult:
 
 
 @dataclass(frozen=True)
+class ClipBuildResult:
+    clip_id: str
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    decisions: list[dict[str, Any]] = field(default_factory=list)
+    talking_observations: list[FrameObservation] = field(default_factory=list)
+    cache_hits: dict[str, bool] = field(default_factory=dict)
+    timings: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ClipBuildFailure:
+    clip_id: str
+    error: Exception
+
+
+@dataclass(frozen=True)
 class SilentTalkingBuildResult:
     snapshot_root: Path
     train_rows: int
@@ -200,6 +233,60 @@ class SilentTalkingBuildResult:
     failed_clips: tuple[str, ...]
     config_sha256: str
     hub_ref: str = ""
+
+
+class ThreadLocalDetectorPool:
+    def __init__(self, factory: Callable[[], LandmarkDetector]) -> None:
+        self._factory = factory
+        self._local = threading.local()
+        self._detectors: list[LandmarkDetector] = []
+        self._lock = threading.Lock()
+
+    def get(self) -> LandmarkDetector:
+        detector = getattr(self._local, "detector", None)
+        if detector is None:
+            detector = self._factory()
+            self._local.detector = detector
+            with self._lock:
+                self._detectors.append(detector)
+        return cast(LandmarkDetector, detector)
+
+    def close_all(self) -> None:
+        with self._lock:
+            detectors = list(self._detectors)
+            self._detectors.clear()
+        for detector in detectors:
+            detector.close()
+
+
+def run_clip_workers(
+    videos: list[Path],
+    worker: Callable[[Path], ClipBuildResult],
+    *,
+    max_workers: int,
+    strict: bool,
+) -> tuple[list[ClipBuildResult], list[ClipBuildFailure]]:
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+    results: list[ClipBuildResult] = []
+    failures: list[ClipBuildFailure] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_video = {
+            executor.submit(worker, video): video for video in sorted(videos)
+        }
+        for future in as_completed(future_to_video):
+            video = future_to_video[future]
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                if strict or _clip_failure_is_fatal(exc):
+                    for pending in future_to_video:
+                        pending.cancel()
+                    raise
+                failures.append(ClipBuildFailure(clip_id=video.stem, error=exc))
+    results.sort(key=lambda result: result.clip_id)
+    failures.sort(key=lambda failure: failure.clip_id)
+    return results, failures
 
 
 def discover_talking_videos(directory: str | Path) -> list[Path]:
@@ -1375,6 +1462,12 @@ def _validate_config(config: SilentTalkingBuildConfig) -> None:
         raise ValueError(
             "identity.expected_sha256 must contain 64 hexadecimal characters"
         ) from exc
+    if config.runtime.device not in {"auto", "cuda", "cpu"}:
+        raise ValueError("runtime.device must be auto, cuda, or cpu")
+    if config.runtime.clip_workers < 1:
+        raise ValueError("runtime.clip_workers must be >= 1")
+    if config.runtime.cuda_max_inflight < 1:
+        raise ValueError("runtime.cuda_max_inflight must be >= 1")
     if not config.silent_video_path.is_file():
         raise FileNotFoundError(config.silent_video_path)
     if not Path(config.wenet_onnx).is_file():
@@ -1427,54 +1520,240 @@ def _write_failed_clip_report(path: Path, clip_id: str, exc: Exception) -> None:
 
 
 def _clip_failure_is_fatal(exc: Exception) -> bool:
-    return isinstance(exc, IdentityRuntimeError)
+    return isinstance(exc, (IdentityRuntimeError, OnnxRuntimeError))
+
+
+def _process_talking_clip(
+    video: Path,
+    *,
+    config: SilentTalkingBuildConfig,
+    work_root: Path,
+    silent_observations: list[FrameObservation],
+    silent_frames_dir: Path,
+    split_mode: str,
+    video_splits: dict[str, str],
+    identity_runtime: IdentityRuntime,
+    identity_sha256: str,
+    wenet_runtime: WenetRuntime,
+    wenet_sha256: str,
+    landmark_model: Path | None,
+    detector: LandmarkDetector,
+) -> ClipBuildResult:
+    clip_started = perf_counter()
+    clip_id = video.stem
+    clip_work = work_root / "normalized" / "talking" / clip_id
+    timings: dict[str, float] = {}
+
+    started = perf_counter()
+    normalized = cached_normalize_talking_video(
+        video,
+        clip_work / "video_25fps.mkv",
+        clip_work / "audio.wav",
+        fps=config.fps,
+        sample_rate=config.sample_rate,
+    )
+    normalized_video, audio_path = normalized.value
+    timings["normalize_seconds"] = perf_counter() - started
+
+    started = perf_counter()
+    extracted = cached_extract_frames(
+        normalized_video,
+        clip_work / "frames",
+        show_progress=config.progress,
+        progress_desc=f"extract {clip_id}",
+    )
+    frames_dir = clip_work / "frames"
+    frame_count = extracted.value
+    timings["frames_seconds"] = perf_counter() - started
+
+    started = perf_counter()
+    bnf = cached_bnf_windows(
+        audio_path,
+        work_root / "bnf" / clip_id / "windows.npy",
+        wenet_runtime,
+        wenet_sha256=wenet_sha256,
+        sample_rate=config.sample_rate,
+    )
+    audio_rms = _frame_aligned_rms(audio_path, frame_count)
+    timings["bnf_seconds"] = perf_counter() - started
+
+    analysis_path = work_root / "analysis" / "talking" / clip_id / "analysis.jsonl"
+    analysis_metadata = analysis_cache_metadata(
+        video,
+        frame_count=frame_count,
+        landmark_model_path=landmark_model,
+        identity_sha256=identity_sha256,
+    )
+    analysis_hit = _load_analysis_cache(analysis_path, analysis_metadata) is not None
+    started = perf_counter()
+    talking_observations = analyze_frames(
+        frames_dir,
+        frame_count=frame_count,
+        detector=detector,
+        identity_runtime=identity_runtime,
+        cache_path=analysis_path,
+        cache_metadata=analysis_metadata,
+        is_target=True,
+        show_progress=config.progress,
+    )
+    timings["analysis_seconds"] = perf_counter() - started
+
+    split_for_frame: Callable[[int], str]
+    if split_mode == "video":
+        def video_split_for_frame(_frame_idx: int) -> str:
+            return video_splits[clip_id]
+
+        split_for_frame = video_split_for_frame
+    else:
+        def time_split_for_frame(frame_idx: int) -> str:
+            return single_video_split(
+                frame_idx - 1,
+                frame_count=frame_count,
+                validation_fraction=config.validation_fraction,
+            )
+
+        split_for_frame = time_split_for_frame
+
+    started = perf_counter()
+    decision_result = build_pair_decisions(
+        talking_observations=talking_observations,
+        silent_observations=silent_observations,
+        bnf_windows=bnf.value,
+        audio_rms=audio_rms,
+        config=config,
+        split_for_frame=split_for_frame,
+        talking_clip_id=clip_id,
+    )
+    attached = [
+        attach_roi_images(
+            row,
+            silent_frames_dir=silent_frames_dir,
+            talking_frames_dir=frames_dir,
+        )
+        for row in decision_result.rows
+    ]
+    timings["pairing_seconds"] = perf_counter() - started
+    timings["total_seconds"] = perf_counter() - clip_started
+    return ClipBuildResult(
+        clip_id=clip_id,
+        rows=attached,
+        decisions=decision_result.decisions,
+        talking_observations=talking_observations,
+        cache_hits={
+            "normalized_media": normalized.hit,
+            "frames": extracted.hit,
+            "analysis": analysis_hit,
+            "bnf": bnf.hit,
+        },
+        timings=timings,
+    )
+
+
+def _cache_summary(cache_hits: list[dict[str, bool]]) -> dict[str, dict[str, int]]:
+    stages = sorted({stage for item in cache_hits for stage in item})
+    return {
+        stage: {
+            "hits": sum(bool(item.get(stage)) for item in cache_hits),
+            "misses": sum(not bool(item.get(stage)) for item in cache_hits),
+        }
+        for stage in stages
+    }
+
+
+def _timing_summary(timings: list[dict[str, float]]) -> dict[str, float]:
+    stages = sorted({stage for item in timings for stage in item})
+    return {
+        stage: float(sum(item.get(stage, 0.0) for item in timings))
+        for stage in stages
+    }
 
 
 def _build_snapshot_contents(
     config: SilentTalkingBuildConfig,
     temporary_root: Path,
 ) -> dict[str, Any]:
+    build_started = perf_counter()
     work_root = Path(config.work_root) / config.persona_id
-    identity_runtime, identity_provenance = create_identity_runtime(config.identity)
-    wenet_runtime = WenetRuntime(config.wenet_onnx)
+    provider_selection = resolve_onnx_providers(
+        config.runtime.device,
+        warn_on_fallback=config.runtime.warn_on_cpu_fallback,
+    )
+    run_limiter = OnnxRunLimiter(
+        provider_selection,
+        max_inflight=config.runtime.cuda_max_inflight,
+    )
+    identity_runtime, identity_provenance = create_identity_runtime(
+        config.identity,
+        provider_selection=provider_selection,
+        run_limiter=run_limiter,
+    )
+    wenet_runtime = WenetRuntime(
+        config.wenet_onnx,
+        provider_selection=provider_selection,
+        run_limiter=run_limiter,
+    )
     wenet_identity = file_identity(Path(config.wenet_onnx))
+    selected_provider = provider_selection.selected_providers[0]
+    print(
+        "runtime "
+        f"requested={provider_selection.requested_device} "
+        f"arcface={selected_provider} "
+        f"wenet={selected_provider} "
+        f"clip_workers={config.runtime.clip_workers} "
+        f"cuda_max_inflight={config.runtime.cuda_max_inflight}",
+        flush=True,
+    )
     landmark_model = (
         Path(config.landmark_model_asset_path)
         if config.landmark_model_asset_path
         else None
     )
+    silent_timings: dict[str, float] = {}
     silent_work = work_root / "normalized" / "silent"
-    silent_video = cached_normalize_visual_video(
+    started = perf_counter()
+    silent_normalized = cached_normalize_visual_video(
         config.silent_video_path,
         silent_work / "video_25fps.mkv",
         fps=config.fps,
-    ).value
+    )
+    silent_video = silent_normalized.value
+    silent_timings["normalize_seconds"] = perf_counter() - started
     silent_frames_dir = silent_work / "frames"
-    silent_frame_count = cached_extract_frames(
+    started = perf_counter()
+    silent_frames = cached_extract_frames(
         silent_video,
         silent_frames_dir,
         show_progress=config.progress,
         progress_desc="extract silent",
-    ).value
+    )
+    silent_frame_count = silent_frames.value
+    silent_timings["frames_seconds"] = perf_counter() - started
+    silent_analysis_path = work_root / "analysis" / "silent" / "analysis.jsonl"
+    silent_analysis_metadata = analysis_cache_metadata(
+        config.silent_video_path,
+        frame_count=silent_frame_count,
+        landmark_model_path=landmark_model,
+        identity_sha256=str(identity_provenance["sha256"]),
+    )
+    silent_analysis_hit = (
+        _load_analysis_cache(silent_analysis_path, silent_analysis_metadata) is not None
+    )
     silent_detector = _create_detector(config)
+    started = perf_counter()
     try:
         silent_observations = analyze_frames(
             silent_frames_dir,
             frame_count=silent_frame_count,
             detector=silent_detector,
             identity_runtime=identity_runtime,
-            cache_path=work_root / "analysis" / "silent" / "analysis.jsonl",
-            cache_metadata=analysis_cache_metadata(
-                config.silent_video_path,
-                frame_count=silent_frame_count,
-                landmark_model_path=landmark_model,
-                identity_sha256=str(identity_provenance["sha256"]),
-            ),
+            cache_path=silent_analysis_path,
+            cache_metadata=silent_analysis_metadata,
             is_target=False,
             show_progress=config.progress,
         )
     finally:
         silent_detector.close()
+    silent_timings["analysis_seconds"] = perf_counter() - started
     write_json_atomic(
         temporary_root / "reports/quality/silent.json",
         {
@@ -1502,134 +1781,101 @@ def _build_snapshot_contents(
     else:
         split_mode = "single_video_contiguous_fallback"
 
-    rows: list[dict[str, Any]] = []
-    failed_clips: list[str] = []
-    all_decision_paths: list[str] = []
-    for video in talking_videos:
-        clip_id = video.stem
-        clip_work = work_root / "normalized" / "talking" / clip_id
-        try:
-            normalized_video, audio_path = cached_normalize_talking_video(
+    detector_pool = ThreadLocalDetectorPool(lambda: _create_detector(config))
+    try:
+        clip_results, clip_failures = run_clip_workers(
+            talking_videos,
+            lambda video: _process_talking_clip(
                 video,
-                clip_work / "video_25fps.mkv",
-                clip_work / "audio.wav",
-                fps=config.fps,
-                sample_rate=config.sample_rate,
-            ).value
-            frames_dir = clip_work / "frames"
-            frame_count = cached_extract_frames(
-                normalized_video,
-                frames_dir,
-                show_progress=config.progress,
-                progress_desc=f"extract {clip_id}",
-            ).value
-            bnf_windows = cached_bnf_windows(
-                audio_path,
-                work_root / "bnf" / clip_id / "windows.npy",
-                wenet_runtime,
-                wenet_sha256=str(wenet_identity["sha256"]),
-                sample_rate=config.sample_rate,
-            ).value
-            audio_rms = _frame_aligned_rms(audio_path, frame_count)
-            talking_detector = _create_detector(config)
-            try:
-                talking_observations = analyze_frames(
-                    frames_dir,
-                    frame_count=frame_count,
-                    detector=talking_detector,
-                    identity_runtime=identity_runtime,
-                    cache_path=work_root / "analysis" / "talking" / clip_id / "analysis.jsonl",
-                    cache_metadata=analysis_cache_metadata(
-                        video,
-                        frame_count=frame_count,
-                        landmark_model_path=landmark_model,
-                        identity_sha256=str(identity_provenance["sha256"]),
-                    ),
-                    is_target=True,
-                    show_progress=config.progress,
-                )
-            finally:
-                talking_detector.close()
-            if split_mode == "video":
-
-                def video_split_for_frame(_frame_idx: int, cid: str = clip_id) -> str:
-                    return video_splits[cid]
-
-                split_for_frame = video_split_for_frame
-            else:
-
-                def time_split_for_frame(frame_idx: int, count: int = frame_count) -> str:
-                    return single_video_split(
-                        frame_idx - 1,
-                        frame_count=count,
-                        validation_fraction=config.validation_fraction,
-                    )
-
-                split_for_frame = time_split_for_frame
-            result = build_pair_decisions(
-                talking_observations=talking_observations,
-                silent_observations=silent_observations,
-                bnf_windows=bnf_windows,
-                audio_rms=audio_rms,
                 config=config,
-                split_for_frame=split_for_frame,
-                talking_clip_id=clip_id,
-            )
-            attached = [
-                attach_roi_images(
-                    row,
-                    silent_frames_dir=silent_frames_dir,
-                    talking_frames_dir=frames_dir,
-                )
-                for row in result.rows
-            ]
-            rows.extend(attached)
-            decision_path = (
-                temporary_root
-                / "reports/quality"
-                / f"{clip_id}_frame_decisions.parquet"
-            )
-            write_frame_decisions(decision_path, result.decisions)
-            all_decision_paths.append(str(decision_path.relative_to(temporary_root)))
-            write_json_atomic(
-                temporary_root / "reports/quality" / f"{clip_id}.json",
-                quality_report(
-                    clip_id=clip_id,
-                    talking_observations=talking_observations,
-                    decisions=result.decisions,
-                    rows=attached,
-                    identity=identity_provenance,
-                ),
-            )
-            write_preview_groups(
-                out_dir=temporary_root / "reports/previews" / clip_id,
-                rows=attached,
+                work_root=work_root,
+                silent_observations=silent_observations,
+                silent_frames_dir=silent_frames_dir,
+                split_mode=split_mode,
+                video_splits=video_splits,
+                identity_runtime=identity_runtime,
+                identity_sha256=str(identity_provenance["sha256"]),
+                wenet_runtime=wenet_runtime,
+                wenet_sha256=str(wenet_identity["sha256"]),
+                landmark_model=landmark_model,
+                detector=detector_pool.get(),
+            ),
+            max_workers=config.runtime.clip_workers,
+            strict=config.strict,
+        )
+    finally:
+        detector_pool.close_all()
+
+    rows: list[dict[str, Any]] = []
+    all_decision_paths: list[str] = []
+    for result in clip_results:
+        rows.extend(result.rows)
+        decision_path = (
+            temporary_root
+            / "reports/quality"
+            / f"{result.clip_id}_frame_decisions.parquet"
+        )
+        write_frame_decisions(decision_path, result.decisions)
+        all_decision_paths.append(str(decision_path.relative_to(temporary_root)))
+        write_json_atomic(
+            temporary_root / "reports/quality" / f"{result.clip_id}.json",
+            quality_report(
+                clip_id=result.clip_id,
+                talking_observations=result.talking_observations,
                 decisions=result.decisions,
-                count=config.preview_count_per_group,
-            )
-        except Exception as exc:
-            if _clip_failure_is_fatal(exc):
-                raise
-            failed_clips.append(clip_id)
-            _write_failed_clip_report(
-                temporary_root / "reports/quality" / f"{clip_id}.json",
-                clip_id,
-                exc,
-            )
-            if config.strict:
-                raise
+                rows=result.rows,
+                identity=identity_provenance,
+            ),
+        )
+        write_preview_groups(
+            out_dir=temporary_root / "reports/previews" / result.clip_id,
+            rows=result.rows,
+            decisions=result.decisions,
+            count=config.preview_count_per_group,
+        )
+    for failure in clip_failures:
+        _write_failed_clip_report(
+            temporary_root / "reports/quality" / f"{failure.clip_id}.json",
+            failure.clip_id,
+            failure.error,
+        )
+
     dataset = build_dataset_dict(rows)
     fingerprints = _save_and_validate_dataset(dataset, temporary_root)
+    cache_inputs = [
+        {
+            "normalized_media": silent_normalized.hit,
+            "frames": silent_frames.hit,
+            "analysis": silent_analysis_hit,
+        },
+        *(result.cache_hits for result in clip_results),
+    ]
+    timings = _timing_summary(
+        [silent_timings, *(result.timings for result in clip_results)]
+    )
+    timings["total_seconds"] = perf_counter() - build_started
     return {
         "train_rows": len(dataset["train"]),
         "val_rows": len(dataset["val"]),
         "talking_clips": len(talking_videos),
-        "failed_clips": failed_clips,
+        "failed_clips": [failure.clip_id for failure in clip_failures],
         "dataset_fingerprints": fingerprints,
         "split_mode": split_mode,
         "decision_paths": all_decision_paths,
         "row_count": len(rows),
         "identity": identity_provenance,
+        "runtime": {
+            "requested_device": provider_selection.requested_device,
+            "available_providers": list(provider_selection.available_providers),
+            "arcface_providers": list(provider_selection.selected_providers),
+            "wenet_providers": list(provider_selection.selected_providers),
+            "cpu_fallback": provider_selection.cpu_fallback,
+            "fallback_reason": provider_selection.fallback_reason,
+            "clip_workers": config.runtime.clip_workers,
+            "cuda_max_inflight": config.runtime.cuda_max_inflight,
+        },
+        "cache": _cache_summary(cache_inputs),
+        "timings": timings,
     }
 
 
@@ -1695,6 +1941,7 @@ def build_config_from_mapping(payload: dict[str, Any]) -> SilentTalkingBuildConf
     values["match"] = MatchConfig(**dict(values.pop("matching", {})))
     values["identity"] = IdentityConfig(**dict(values.pop("identity", {})))
     values["blur"] = BlurConfig(**dict(values.pop("blur", {})))
+    values["runtime"] = RuntimeConfig(**dict(values.pop("runtime", {})))
     sync_values = dict(values.pop("sync", {}))
     values["sync"] = SyncConfig(**sync_values)
     post_crop = dict(values.pop("post_crop_alignment", {}))

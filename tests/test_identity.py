@@ -248,8 +248,8 @@ def test_arcface_runtime_uses_shared_run_limiter(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def run(self, session, output_names, feed):
-            del session, output_names, feed
+        def run(self, session, output_names, inputs):
+            del session, output_names, inputs
             self.calls += 1
             return [np.ones((1, 512), dtype=np.float32)]
 

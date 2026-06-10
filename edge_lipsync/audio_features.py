@@ -12,6 +12,7 @@ import onnxruntime as ort
 from edge_lipsync.onnx_runtime import (
     OnnxProviderSelection,
     OnnxRunExecutor,
+    OnnxRuntimeError,
     resolve_onnx_providers,
 )
 
@@ -293,22 +294,28 @@ class WenetRuntime:
             warn_on_fallback=False,
         )
         self.run_limiter = run_limiter
-        self.session: Any = session or ort.InferenceSession(
-            str(self.model_path),
-            providers=list(self.provider_selection.selected_providers),
-        )
+        try:
+            self.session: Any = session or ort.InferenceSession(
+                str(self.model_path),
+                providers=list(self.provider_selection.selected_providers),
+            )
+        except Exception as exc:
+            raise OnnxRuntimeError(f"Failed to load Wenet ONNX model: {exc}") from exc
 
     def run(
         self,
         output_names: list[str],
         inputs: dict[str, np.ndarray],
     ) -> list[np.ndarray]:
-        if self.run_limiter is not None:
-            return cast(
-                list[np.ndarray],
-                self.run_limiter.run(self.session, output_names, inputs),
-            )
-        return cast(list[np.ndarray], self.session.run(output_names, inputs))
+        try:
+            if self.run_limiter is not None:
+                return cast(
+                    list[np.ndarray],
+                    self.run_limiter.run(self.session, output_names, inputs),
+                )
+            return cast(list[np.ndarray], self.session.run(output_names, inputs))
+        except Exception as exc:
+            raise OnnxRuntimeError(f"Wenet inference failed: {exc}") from exc
 
     def extract_wav(self, wav_path: str | Path) -> np.ndarray:
         audio = load_wav_mono_f32(wav_path)
