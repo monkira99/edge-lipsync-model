@@ -13,6 +13,11 @@ idle_sample_weight: 0.25
 preview_count_per_group: 8
 progress: true
 strict: false
+runtime:
+  device: auto
+  clip_workers: 4
+  cuda_max_inflight: 2
+  warn_on_cpu_fallback: true
 matching:
   max_yaw_delta: 5.0
   max_pitch_delta: 5.0

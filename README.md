@@ -115,6 +115,23 @@ original MP4 files.
   --config configs/silent_talking_dataset.example.yaml
 ```
 
+The builder processes talking clips concurrently, reuses one ArcFace session and one Wenet
+session, and caches normalized media, extracted frames, frame analysis, and BNF windows under
+`work_root`. Configure `runtime.clip_workers` for CPU-side clip concurrency and
+`runtime.cuda_max_inflight` to bound calls into one NVIDIA GPU.
+
+For CUDA builds, install the GPU ONNX Runtime wheel instead of keeping both CPU and GPU wheels:
+
+```bash
+pip uninstall -y onnxruntime
+pip install "onnxruntime-gpu>=1.17"
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+The provider list must contain `CUDAExecutionProvider`. With `runtime.device: auto` or `cuda`, the
+builder prefers CUDA for ArcFace and Wenet. If CUDA is unavailable, it emits a warning, records the
+fallback in `build_complete.json`, and continues on CPU. MediaPipe FaceLandmarker remains on CPU.
+
 Inspect `reports/quality/*_frame_decisions.parquet` for one decision per normalized talking frame.
 Preview groups live under `reports/previews/<clip_id>/` and include best matches, near-threshold
 matches, low-sync-confidence retained rows, retained idle rows when available, and frequent
