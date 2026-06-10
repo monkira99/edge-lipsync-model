@@ -161,6 +161,61 @@ def test_analyze_frames_rebuilds_when_cache_metadata_changes(
     assert calls == 2
 
 
+def test_analyze_frames_reports_progress_on_cache_miss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.silent_talking_dataset as builder
+
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    cv2.imwrite(str(frames / "000001.png"), np.full((20, 20, 3), 120, dtype=np.uint8))
+    progress_calls: list[dict[str, Any]] = []
+
+    class FakeDetector:
+        def detect_landmarks(self, frame_bgr: np.ndarray) -> None:
+            del frame_bgr
+            return None
+
+        def close(self) -> None:
+            pass
+
+    class FakeIdentityRuntime:
+        def embed(
+            self,
+            frame_bgr: np.ndarray,
+            landmarks: Mapping[int, tuple[float, float]],
+        ) -> np.ndarray:
+            del frame_bgr, landmarks
+            raise AssertionError("Invalid frames must not run ArcFace")
+
+    def fake_progress(iterable: object, **kwargs: Any) -> object:
+        progress_calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(builder, "progress", fake_progress)
+
+    builder.analyze_frames(
+        frames,
+        frame_count=1,
+        detector=FakeDetector(),
+        identity_runtime=FakeIdentityRuntime(),
+        cache_path=tmp_path / "analysis.jsonl",
+        cache_metadata={"input": "fixture"},
+        is_target=False,
+        show_progress=True,
+    )
+
+    assert progress_calls == [
+        {
+            "enabled": True,
+            "desc": "analyze silent",
+            "total": 1,
+            "unit": "frame",
+        }
+    ]
+
+
 def _builder_landmarks() -> dict[int, tuple[float, float]]:
     return {
         1: (100.0, 90.0),
@@ -798,6 +853,38 @@ def test_run_clip_workers_processes_concurrently_and_sorts_results(
     assert peak == 2
     assert [result.clip_id for result in results] == ["a", "b", "c"]
     assert failures == []
+
+
+def test_run_clip_workers_reports_completed_clip_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.silent_talking_dataset as builder
+
+    progress_calls: list[dict[str, Any]] = []
+
+    def fake_progress(iterable: object, **kwargs: Any) -> object:
+        progress_calls.append(kwargs)
+        return iterable
+
+    monkeypatch.setattr(builder, "progress", fake_progress)
+
+    builder.run_clip_workers(
+        [tmp_path / "b.mp4", tmp_path / "a.mp4"],
+        lambda video: builder.ClipBuildResult(clip_id=video.stem),
+        max_workers=2,
+        strict=True,
+        show_progress=True,
+    )
+
+    assert progress_calls == [
+        {
+            "enabled": True,
+            "desc": "build talking clips",
+            "total": 2,
+            "unit": "clip",
+        }
+    ]
 
 
 def test_run_clip_workers_keeps_nonfatal_failures_when_not_strict(

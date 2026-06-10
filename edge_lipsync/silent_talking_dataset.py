@@ -58,6 +58,7 @@ from edge_lipsync.pose_pairing import (
     sync_reject_reason,
 )
 from edge_lipsync.preprocess import ROI_SOURCE_SIZE, BBox, landmarks_to_duix_roi
+from edge_lipsync.progress import progress
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv"}
 SCHEMA_VERSION = "edge_lipsync_silent_talking_pair_v2"
@@ -265,6 +266,7 @@ def run_clip_workers(
     *,
     max_workers: int,
     strict: bool,
+    show_progress: bool = False,
 ) -> tuple[list[ClipBuildResult], list[ClipBuildFailure]]:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
@@ -274,7 +276,14 @@ def run_clip_workers(
         future_to_video = {
             executor.submit(worker, video): video for video in sorted(videos)
         }
-        for future in as_completed(future_to_video):
+        completed = progress(
+            as_completed(future_to_video),
+            enabled=show_progress,
+            desc="build talking clips",
+            total=len(future_to_video),
+            unit="clip",
+        )
+        for future in completed:
             video = future_to_video[future]
             try:
                 results.append(future.result())
@@ -703,7 +712,6 @@ def analyze_frames(
     is_target: bool,
     show_progress: bool = True,
 ) -> list[FrameObservation]:
-    del is_target, show_progress
     root = Path(frames_dir)
     cache = Path(cache_path)
     cached = _load_analysis_cache(cache, cache_metadata)
@@ -711,7 +719,14 @@ def analyze_frames(
         return cached
 
     observations: list[FrameObservation] = []
-    for frame_idx in range(1, frame_count + 1):
+    frame_indices = progress(
+        range(1, frame_count + 1),
+        enabled=show_progress,
+        desc="analyze target" if is_target else "analyze silent",
+        total=frame_count,
+        unit="frame",
+    )
+    for frame_idx in frame_indices:
         frame_path = root / f"{frame_idx:06d}{FRAME_SUFFIX}"
         frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
         if frame is None:
@@ -1559,7 +1574,7 @@ def _process_talking_clip(
     extracted = cached_extract_frames(
         normalized_video,
         clip_work / "frames",
-        show_progress=config.progress,
+        show_progress=False,
         progress_desc=f"extract {clip_id}",
     )
     frames_dir = clip_work / "frames"
@@ -1594,7 +1609,7 @@ def _process_talking_clip(
         cache_path=analysis_path,
         cache_metadata=analysis_metadata,
         is_target=True,
-        show_progress=config.progress,
+        show_progress=False,
     )
     timings["analysis_seconds"] = perf_counter() - started
 
@@ -1803,6 +1818,7 @@ def _build_snapshot_contents(
             ),
             max_workers=config.runtime.clip_workers,
             strict=config.strict,
+            show_progress=config.progress,
         )
     finally:
         detector_pool.close_all()
