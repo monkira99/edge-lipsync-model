@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import wave
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -84,3 +87,77 @@ def test_build_bnf_windows_from_audio_matches_audio_block_count() -> None:
     assert windows.shape == (25, 20, 256)
     assert windows.dtype == np.float32
     assert np.array_equal(windows[0], windows[1])
+
+
+def _write_silent_wav(path: Path, samples: int = 25 * 640) -> None:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(np.zeros(samples, dtype=np.int16).tobytes())
+
+
+def test_wenet_runtime_uses_selected_providers_and_reuses_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.audio_features as audio_features
+    from edge_lipsync.onnx_runtime import resolve_onnx_providers
+
+    model = tmp_path / "wenet.onnx"
+    model.write_bytes(b"onnx")
+    wav = tmp_path / "audio.wav"
+    _write_silent_wav(wav)
+    providers_seen: list[list[str]] = []
+
+    class FakeSession(_FakeWenetSession):
+        pass
+
+    def fake_session(_path: str, *, providers: list[str]) -> FakeSession:
+        providers_seen.append(providers)
+        return FakeSession()
+
+    monkeypatch.setattr(audio_features.ort, "InferenceSession", fake_session)
+    selection = resolve_onnx_providers(
+        "cuda",
+        available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    runtime = audio_features.WenetRuntime(model, provider_selection=selection)
+
+    first = runtime.extract_wav(wav)
+    second = runtime.extract_wav(wav)
+
+    assert first.shape == (25, 20, 256)
+    assert np.array_equal(first, second)
+    assert providers_seen == [["CUDAExecutionProvider", "CPUExecutionProvider"]]
+
+
+def test_wenet_runtime_uses_shared_run_limiter(tmp_path: Path) -> None:
+    from edge_lipsync.audio_features import WenetRuntime
+
+    model = tmp_path / "wenet.onnx"
+    model.write_bytes(b"onnx")
+    wav = tmp_path / "audio.wav"
+    _write_silent_wav(wav)
+
+    class FakeSession:
+        def run(self, _output_names, _inputs):
+            raise AssertionError("session.run must be delegated to the limiter")
+
+    class FakeLimiter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, session, output_names, inputs):
+            del session, output_names
+            self.calls += 1
+            mel = inputs["speech"]
+            rows = int(mel.shape[1] * 0.25 - 0.75)
+            return [np.zeros((1, rows, 256), dtype=np.float32)]
+
+    limiter = FakeLimiter()
+    runtime = WenetRuntime(model, session=FakeSession(), run_limiter=limiter)
+
+    runtime.extract_wav(wav)
+
+    assert limiter.calls > 0

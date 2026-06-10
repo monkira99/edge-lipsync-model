@@ -12,12 +12,13 @@ CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 
 
-class OnnxSession(Protocol):
+class OnnxRunExecutor(Protocol):
     def run(
         self,
+        session: Any,
         output_names: list[str],
         inputs: dict[str, np.ndarray],
-    ) -> list[np.ndarray]: ...
+    ) -> list[Any]: ...
 
 
 @dataclass(frozen=True)
@@ -97,7 +98,7 @@ class OnnxRunLimiter:
 
     def run(
         self,
-        session: OnnxSession,
+        session: Any,
         output_names: list[str],
         inputs: dict[str, np.ndarray],
     ) -> list[Any]:

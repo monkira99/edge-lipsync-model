@@ -11,6 +11,11 @@ import numpy as np
 import onnxruntime as ort
 
 from edge_lipsync.hub import hf_hub_download
+from edge_lipsync.onnx_runtime import (
+    OnnxProviderSelection,
+    OnnxRunExecutor,
+    resolve_onnx_providers,
+)
 from edge_lipsync.preprocess import Point
 
 ARCFACE_INPUT_SIZE = 112
@@ -188,19 +193,33 @@ def _valid_batch_shape(shape: Any, trailing: tuple[int, ...]) -> bool:
 
 
 class ArcFaceRuntime:
-    def __init__(self, model_path: str | Path, *, session: Any | None = None) -> None:
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        provider_selection: OnnxProviderSelection | None = None,
+        run_limiter: OnnxRunExecutor | None = None,
+        session: Any | None = None,
+    ) -> None:
         self.model_path = Path(model_path)
         if not self.model_path.is_file():
             raise IdentityRuntimeError(f"ArcFace model not found: {self.model_path}")
+        selection = provider_selection or resolve_onnx_providers(
+            "cpu",
+            warn_on_fallback=False,
+        )
         if session is None:
             try:
                 session = ort.InferenceSession(
                     str(self.model_path),
-                    providers=["CPUExecutionProvider"],
+                    providers=list(selection.selected_providers),
                 )
             except Exception as exc:
                 raise IdentityRuntimeError(f"Failed to load ArcFace ONNX model: {exc}") from exc
+        assert session is not None
         self.session = session
+        self.provider_selection = selection
+        self.run_limiter = run_limiter
         inputs = list(session.get_inputs())
         outputs = list(session.get_outputs())
         if len(inputs) != 1 or not _valid_batch_shape(inputs[0].shape, (3, 112, 112)):
@@ -220,7 +239,12 @@ class ArcFaceRuntime:
         aligned = align_arcface_face(frame_bgr, landmarks)
         tensor = preprocess_arcface(aligned)
         try:
-            outputs = self.session.run([self.output_name], {self.input_name: tensor})
+            inputs = {self.input_name: tensor}
+            outputs = (
+                self.run_limiter.run(self.session, [self.output_name], inputs)
+                if self.run_limiter is not None
+                else self.session.run([self.output_name], inputs)
+            )
         except Exception as exc:
             raise IdentityRuntimeError(f"ArcFace inference failed: {exc}") from exc
         if len(outputs) != 1:
@@ -239,9 +263,21 @@ class ArcFaceRuntime:
 
 def create_identity_runtime(
     config: IdentityConfig,
+    *,
+    provider_selection: OnnxProviderSelection | None = None,
+    run_limiter: OnnxRunExecutor | None = None,
 ) -> tuple[ArcFaceRuntime, dict[str, Any]]:
     resolved = resolve_identity_model(config)
-    return ArcFaceRuntime(resolved.path), resolved.provenance
+    runtime = ArcFaceRuntime(
+        resolved.path,
+        provider_selection=provider_selection,
+        run_limiter=run_limiter,
+    )
+    provenance = {
+        **resolved.provenance,
+        "providers": list(runtime.provider_selection.selected_providers),
+    }
+    return runtime, provenance
 
 
 def cosine_identity_similarity(source: np.ndarray, target: np.ndarray) -> float:

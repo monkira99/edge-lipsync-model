@@ -193,3 +193,69 @@ def test_arcface_runtime_wraps_onnx_execution_failure(tmp_path: Path) -> None:
 
     with pytest.raises(IdentityRuntimeError, match="ArcFace inference failed"):
         runtime.embed(np.zeros((112, 112, 3), dtype=np.uint8), _arcface_landmarks())
+
+
+def test_arcface_runtime_uses_selected_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.identity as identity
+    from edge_lipsync.onnx_runtime import resolve_onnx_providers
+
+    model = tmp_path / "arcface.onnx"
+    model.write_bytes(b"onnx")
+    captured: list[list[str]] = []
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input", shape=[1, 3, 112, 112])]
+
+        def get_outputs(self):
+            return [SimpleNamespace(name="output", shape=[1, 512])]
+
+    def fake_session(_path: str, *, providers: list[str]) -> FakeSession:
+        captured.append(providers)
+        return FakeSession()
+
+    monkeypatch.setattr(identity.ort, "InferenceSession", fake_session)
+    selection = resolve_onnx_providers(
+        "cuda",
+        available_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    identity.ArcFaceRuntime(model, provider_selection=selection)
+
+    assert captured == [["CUDAExecutionProvider", "CPUExecutionProvider"]]
+
+
+def test_arcface_runtime_uses_shared_run_limiter(tmp_path: Path) -> None:
+    from edge_lipsync.identity import ArcFaceRuntime
+
+    model = tmp_path / "arcface.onnx"
+    model.write_bytes(b"onnx")
+
+    class FakeSession:
+        def get_inputs(self):
+            return [SimpleNamespace(name="input", shape=[1, 3, 112, 112])]
+
+        def get_outputs(self):
+            return [SimpleNamespace(name="output", shape=[1, 512])]
+
+        def run(self, _output_names, _feed):
+            raise AssertionError("session.run must be delegated to the limiter")
+
+    class FakeLimiter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, session, output_names, feed):
+            del session, output_names, feed
+            self.calls += 1
+            return [np.ones((1, 512), dtype=np.float32)]
+
+    limiter = FakeLimiter()
+    runtime = ArcFaceRuntime(model, session=FakeSession(), run_limiter=limiter)
+
+    runtime.embed(np.zeros((112, 112, 3), dtype=np.uint8), _arcface_landmarks())
+
+    assert limiter.calls == 1

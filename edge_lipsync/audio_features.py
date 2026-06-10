@@ -4,10 +4,16 @@ import math
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import onnxruntime as ort
+
+from edge_lipsync.onnx_runtime import (
+    OnnxProviderSelection,
+    OnnxRunExecutor,
+    resolve_onnx_providers,
+)
 
 BLOCK_SAMPLES = 640
 TARGET_SAMPLE_RATE = 16000
@@ -270,7 +276,44 @@ def build_bnf_windows_from_audio(audio: np.ndarray, session: WenetSession) -> np
     )
 
 
+class WenetRuntime:
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        provider_selection: OnnxProviderSelection | None = None,
+        run_limiter: OnnxRunExecutor | None = None,
+        session: WenetSession | None = None,
+    ) -> None:
+        self.model_path = Path(model_path)
+        if not self.model_path.is_file():
+            raise FileNotFoundError(self.model_path)
+        self.provider_selection = provider_selection or resolve_onnx_providers(
+            "cpu",
+            warn_on_fallback=False,
+        )
+        self.run_limiter = run_limiter
+        self.session: Any = session or ort.InferenceSession(
+            str(self.model_path),
+            providers=list(self.provider_selection.selected_providers),
+        )
+
+    def run(
+        self,
+        output_names: list[str],
+        inputs: dict[str, np.ndarray],
+    ) -> list[np.ndarray]:
+        if self.run_limiter is not None:
+            return cast(
+                list[np.ndarray],
+                self.run_limiter.run(self.session, output_names, inputs),
+            )
+        return cast(list[np.ndarray], self.session.run(output_names, inputs))
+
+    def extract_wav(self, wav_path: str | Path) -> np.ndarray:
+        audio = load_wav_mono_f32(wav_path)
+        return build_bnf_windows_from_audio(audio, self)
+
+
 def extract_bnf_windows_from_wav(wav_path: str | Path, wenet_onnx: str | Path) -> np.ndarray:
-    audio = load_wav_mono_f32(wav_path)
-    session = ort.InferenceSession(str(wenet_onnx), providers=["CPUExecutionProvider"])
-    return build_bnf_windows_from_audio(audio, cast(WenetSession, session))
+    return WenetRuntime(wenet_onnx).extract_wav(wav_path)
