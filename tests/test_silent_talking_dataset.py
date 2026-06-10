@@ -464,6 +464,44 @@ def test_dataset_snapshot_roundtrip_keeps_embedded_png_bytes(tmp_path: Path) -> 
     assert np.asarray(loaded["train"][0]["source_roi"]).shape == (168, 168, 3)
 
 
+def test_dataset_shards_assemble_without_collecting_all_rows(tmp_path: Path) -> None:
+    from edge_lipsync.silent_talking_dataset import (
+        ClipBuildResult,
+        build_dataset_dict_from_clip_results,
+        write_dataset_shards,
+    )
+
+    train_row = {**_complete_row("train"), "pair_id": "clip-a:1"}
+    val_row = {**_complete_row("val"), "pair_id": "clip-b:1"}
+    train_shards, train_counts = write_dataset_shards(
+        tmp_path / "shards/clip-a",
+        [train_row],
+    )
+    val_shards, val_counts = write_dataset_shards(
+        tmp_path / "shards/clip-b",
+        [val_row],
+    )
+
+    dataset = build_dataset_dict_from_clip_results(
+        [
+            ClipBuildResult(
+                clip_id="clip-b",
+                dataset_shards=val_shards,
+                row_counts=val_counts,
+            ),
+            ClipBuildResult(
+                clip_id="clip-a",
+                dataset_shards=train_shards,
+                row_counts=train_counts,
+            ),
+        ]
+    )
+
+    assert dataset["train"]["pair_id"] == ["clip-a:1"]
+    assert dataset["val"]["pair_id"] == ["clip-b:1"]
+    assert np.asarray(dataset["train"][0]["source_roi"]).shape == (168, 168, 3)
+
+
 def test_build_silent_talking_dataset_writes_complete_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -852,6 +890,37 @@ def test_run_clip_workers_processes_concurrently_and_sorts_results(
 
     assert peak == 2
     assert [result.clip_id for result in results] == ["a", "b", "c"]
+    assert failures == []
+
+
+def test_run_clip_workers_releases_heavy_result_payloads(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from edge_lipsync.silent_talking_dataset import ClipBuildResult, run_clip_workers
+
+    handled: list[str] = []
+
+    def persist_result(result: ClipBuildResult) -> ClipBuildResult:
+        handled.append(result.clip_id)
+        assert result.rows
+        return replace(result, rows=[])
+
+    results, failures = run_clip_workers(
+        [tmp_path / "b.mp4", tmp_path / "a.mp4"],
+        lambda video: ClipBuildResult(
+            clip_id=video.stem,
+            rows=[{"payload": b"x" * 1024}],
+        ),
+        max_workers=1,
+        strict=True,
+        result_handler=persist_result,
+    )
+
+    assert handled == ["a", "b"]
+    assert [result.clip_id for result in results] == ["a", "b"]
+    assert all(result.rows == [] for result in results)
     assert failures == []
 
 

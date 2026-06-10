@@ -6,8 +6,8 @@ import math
 import shutil
 import threading
 from collections import Counter
-from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
@@ -215,6 +215,9 @@ class ClipBuildResult:
     rows: list[dict[str, Any]] = field(default_factory=list)
     decisions: list[dict[str, Any]] = field(default_factory=list)
     talking_observations: list[FrameObservation] = field(default_factory=list)
+    dataset_shards: dict[str, Path] = field(default_factory=dict)
+    row_counts: dict[str, int] = field(default_factory=dict)
+    decision_path: str | None = None
     cache_hits: dict[str, bool] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
 
@@ -267,29 +270,54 @@ def run_clip_workers(
     max_workers: int,
     strict: bool,
     show_progress: bool = False,
+    result_handler: Callable[[ClipBuildResult], ClipBuildResult] | None = None,
 ) -> tuple[list[ClipBuildResult], list[ClipBuildFailure]]:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     results: list[ClipBuildResult] = []
     failures: list[ClipBuildFailure] = []
+    sorted_videos = sorted(videos)
+    pending_futures: dict[Future[ClipBuildResult], Path] = {}
+
+    def completed_futures(
+        executor: ThreadPoolExecutor,
+    ) -> Iterator[tuple[Future[ClipBuildResult], Path]]:
+        next_video = iter(sorted_videos)
+
+        def submit_next() -> bool:
+            try:
+                video = next(next_video)
+            except StopIteration:
+                return False
+            pending_futures[executor.submit(worker, video)] = video
+            return True
+
+        for _ in range(min(max_workers, len(sorted_videos))):
+            submit_next()
+        while pending_futures:
+            done, _ = wait(tuple(pending_futures), return_when=FIRST_COMPLETED)
+            for future in sorted(done, key=lambda item: str(pending_futures[item])):
+                video = pending_futures.pop(future)
+                yield future, video
+                submit_next()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_video = {
-            executor.submit(worker, video): video for video in sorted(videos)
-        }
         completed = progress(
-            as_completed(future_to_video),
+            completed_futures(executor),
             enabled=show_progress,
             desc="build talking clips",
-            total=len(future_to_video),
+            total=len(sorted_videos),
             unit="clip",
         )
-        for future in completed:
-            video = future_to_video[future]
+        for future, video in completed:
             try:
-                results.append(future.result())
+                result = future.result()
+                if result_handler is not None:
+                    result = result_handler(result)
+                results.append(result)
             except Exception as exc:
                 if strict or _clip_failure_is_fatal(exc):
-                    for pending in future_to_video:
+                    for pending in pending_futures:
                         pending.cancel()
                     raise
                 failures.append(ClipBuildFailure(clip_id=video.stem, error=exc))
@@ -1177,6 +1205,58 @@ def build_dataset_dict(rows: list[dict[str, Any]]) -> DatasetDict:
     return DatasetDict(list(datasets.items()))
 
 
+def write_dataset_shards(
+    root: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, Path], dict[str, int]]:
+    for row in rows:
+        _validate_snapshot_row(row)
+    shards: dict[str, Path] = {}
+    row_counts: dict[str, int] = {}
+    for split in ("train", "val"):
+        split_rows = [row for row in rows if row["split"] == split]
+        if not split_rows:
+            continue
+        shard_path = root / split
+        temporary = root / f"{split}.building"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        Dataset.from_list(
+            [
+                {key: value for key, value in row.items() if key != "split"}
+                for row in split_rows
+            ],
+            features=SILENT_TALKING_FEATURES,
+        ).save_to_disk(temporary)
+        if shard_path.exists():
+            shutil.rmtree(shard_path)
+        temporary.replace(shard_path)
+        shards[split] = shard_path
+        row_counts[split] = len(split_rows)
+    return shards, row_counts
+
+
+def build_dataset_dict_from_clip_results(
+    results: list[ClipBuildResult],
+) -> DatasetDict:
+    from datasets import concatenate_datasets, load_from_disk
+
+    split_datasets: dict[str, Dataset] = {}
+    for split in ("train", "val"):
+        shards = [
+            cast(Dataset, load_from_disk(result.dataset_shards[split]))
+            for result in sorted(results, key=lambda item: item.clip_id)
+            if split in result.dataset_shards
+        ]
+        if not shards:
+            raise ValueError("Both train and val splits must be non-empty")
+        split_datasets[split] = (
+            shards[0] if len(shards) == 1 else concatenate_datasets(shards)
+        )
+    return DatasetDict(list(split_datasets.items()))
+
+
 def write_frame_decisions(path: Path, decisions: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not decisions:
@@ -1797,6 +1877,45 @@ def _build_snapshot_contents(
     else:
         split_mode = "single_video_contiguous_fallback"
 
+    dataset_shard_root = temporary_root / ".dataset_shards"
+
+    def persist_clip_result(result: ClipBuildResult) -> ClipBuildResult:
+        decision_path = (
+            temporary_root
+            / "reports/quality"
+            / f"{result.clip_id}_frame_decisions.parquet"
+        )
+        write_frame_decisions(decision_path, result.decisions)
+        write_json_atomic(
+            temporary_root / "reports/quality" / f"{result.clip_id}.json",
+            quality_report(
+                clip_id=result.clip_id,
+                talking_observations=result.talking_observations,
+                decisions=result.decisions,
+                rows=result.rows,
+                identity=identity_provenance,
+            ),
+        )
+        write_preview_groups(
+            out_dir=temporary_root / "reports/previews" / result.clip_id,
+            rows=result.rows,
+            decisions=result.decisions,
+            count=config.preview_count_per_group,
+        )
+        dataset_shards, row_counts = write_dataset_shards(
+            dataset_shard_root / result.clip_id,
+            result.rows,
+        )
+        return replace(
+            result,
+            rows=[],
+            decisions=[],
+            talking_observations=[],
+            dataset_shards=dataset_shards,
+            row_counts=row_counts,
+            decision_path=str(decision_path.relative_to(temporary_root)),
+        )
+
     detector_pool = ThreadLocalDetectorPool(lambda: _create_detector(config))
     try:
         clip_results, clip_failures = run_clip_workers(
@@ -1819,37 +1938,16 @@ def _build_snapshot_contents(
             max_workers=config.runtime.clip_workers,
             strict=config.strict,
             show_progress=config.progress,
+            result_handler=persist_clip_result,
         )
     finally:
         detector_pool.close_all()
 
-    rows: list[dict[str, Any]] = []
-    all_decision_paths: list[str] = []
-    for result in clip_results:
-        rows.extend(result.rows)
-        decision_path = (
-            temporary_root
-            / "reports/quality"
-            / f"{result.clip_id}_frame_decisions.parquet"
-        )
-        write_frame_decisions(decision_path, result.decisions)
-        all_decision_paths.append(str(decision_path.relative_to(temporary_root)))
-        write_json_atomic(
-            temporary_root / "reports/quality" / f"{result.clip_id}.json",
-            quality_report(
-                clip_id=result.clip_id,
-                talking_observations=result.talking_observations,
-                decisions=result.decisions,
-                rows=result.rows,
-                identity=identity_provenance,
-            ),
-        )
-        write_preview_groups(
-            out_dir=temporary_root / "reports/previews" / result.clip_id,
-            rows=result.rows,
-            decisions=result.decisions,
-            count=config.preview_count_per_group,
-        )
+    all_decision_paths = [
+        result.decision_path
+        for result in clip_results
+        if result.decision_path is not None
+    ]
     for failure in clip_failures:
         _write_failed_clip_report(
             temporary_root / "reports/quality" / f"{failure.clip_id}.json",
@@ -1857,8 +1955,12 @@ def _build_snapshot_contents(
             failure.error,
         )
 
-    dataset = build_dataset_dict(rows)
+    dataset = build_dataset_dict_from_clip_results(clip_results)
+    train_rows = sum(result.row_counts.get("train", 0) for result in clip_results)
+    val_rows = sum(result.row_counts.get("val", 0) for result in clip_results)
     fingerprints = _save_and_validate_dataset(dataset, temporary_root)
+    del dataset
+    shutil.rmtree(dataset_shard_root)
     cache_inputs = [
         {
             "normalized_media": silent_normalized.hit,
@@ -1872,14 +1974,14 @@ def _build_snapshot_contents(
     )
     timings["total_seconds"] = perf_counter() - build_started
     return {
-        "train_rows": len(dataset["train"]),
-        "val_rows": len(dataset["val"]),
+        "train_rows": train_rows,
+        "val_rows": val_rows,
         "talking_clips": len(talking_videos),
         "failed_clips": [failure.clip_id for failure in clip_failures],
         "dataset_fingerprints": fingerprints,
         "split_mode": split_mode,
         "decision_paths": all_decision_paths,
-        "row_count": len(rows),
+        "row_count": train_rows + val_rows,
         "identity": identity_provenance,
         "runtime": {
             "requested_device": provider_selection.requested_device,
