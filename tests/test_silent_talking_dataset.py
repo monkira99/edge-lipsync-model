@@ -681,6 +681,24 @@ def test_analysis_cache_metadata_uses_only_analysis_inputs(tmp_path: Path) -> No
     assert "preview_count_per_group" not in metadata
 
 
+def test_cache_summary_does_not_count_missing_stage_as_miss() -> None:
+    from edge_lipsync.silent_talking_dataset import _cache_summary
+
+    summary = _cache_summary(
+        [
+            {"normalized_media": True, "frames": True, "analysis": True},
+            {
+                "normalized_media": False,
+                "frames": False,
+                "analysis": False,
+                "bnf": False,
+            },
+        ]
+    )
+
+    assert summary["bnf"] == {"hits": 0, "misses": 1}
+
+
 def test_build_config_from_mapping_maps_runtime_options() -> None:
     from edge_lipsync.silent_talking_dataset import build_config_from_mapping
 

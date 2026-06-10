@@ -1651,13 +1651,14 @@ def _process_talking_clip(
 
 def _cache_summary(cache_hits: list[dict[str, bool]]) -> dict[str, dict[str, int]]:
     stages = sorted({stage for item in cache_hits for stage in item})
-    return {
-        stage: {
-            "hits": sum(bool(item.get(stage)) for item in cache_hits),
-            "misses": sum(not bool(item.get(stage)) for item in cache_hits),
+    summary: dict[str, dict[str, int]] = {}
+    for stage in stages:
+        outcomes = [item[stage] for item in cache_hits if stage in item]
+        summary[stage] = {
+            "hits": sum(outcomes),
+            "misses": sum(not outcome for outcome in outcomes),
         }
-        for stage in stages
-    }
+    return summary
 
 
 def _timing_summary(timings: list[dict[str, float]]) -> dict[str, float]:
