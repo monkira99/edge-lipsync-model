@@ -1001,6 +1001,404 @@ def test_render_best_media_eval_keeps_training_nonfatal_when_wandb_video_fails(
     assert artifacts["wandb_video_error"] == "wandb upload failed"
 
 
+def test_train_retries_failed_resume_upload_at_final_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.hub import HubArtifact
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    class FakeTracker:
+        provenance = {"mode": "disabled"}
+
+        def __init__(self) -> None:
+            self.summary: dict[str, Any] = {}
+
+        def log_metrics(self, metrics: dict[str, Any], *, step: int) -> None:
+            pass
+
+        def update_summary(self, values: dict[str, Any]) -> None:
+            self.summary.update(values)
+
+        def finish(self, *, exit_code: int = 0) -> None:
+            pass
+
+    tracker = FakeTracker()
+    upload_steps: list[int] = []
+
+    def fake_push_resume(
+        checkpoint_path: Path,
+        repo_id: str,
+        *,
+        step: int,
+        private: bool,
+    ) -> HubArtifact:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        assert payload["step"] == step
+        assert repo_id == "owner/avatar-model"
+        assert private is True
+        upload_steps.append(step)
+        if step == 2:
+            raise RuntimeError("temporary hub failure")
+        return HubArtifact(
+            repo_id=repo_id,
+            requested_ref=f"resume-{step}",
+            resolved_ref=f"resume-{step}",
+            url=f"https://huggingface.co/owner/avatar-model/tree/resume-{step}",
+        )
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(training, "create_tracker", lambda *_args, **_kwargs: tracker)
+    monkeypatch.setattr(training, "push_resume_checkpoint", fake_push_resume)
+    monkeypatch.setattr(
+        training,
+        "push_model_artifacts",
+        lambda *_args, **_kwargs: HubArtifact(
+            repo_id="owner/avatar-model",
+            requested_ref="model-ref",
+            resolved_ref="model-ref",
+            url="https://huggingface.co/owner/avatar-model/tree/model-ref",
+        ),
+    )
+
+    training.train(
+        training.TrainConfig(
+            dataset_root=str(dataset_root),
+            manifest="manifest.jsonl",
+            run_dir=str(run_dir),
+            init_bin="/tmp/dh_model.bin",
+            hf_model_repo="owner/avatar-model",
+            hf_resume_upload_interval=2,
+            device="cpu",
+            max_steps=3,
+            warmup_steps=0,
+            stabilization_steps=0,
+            validation_interval=10,
+            checkpoint_interval=10,
+            media_eval_on_best=False,
+        )
+    )
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert [row["step"] for row in metrics] == [1, 2, 3]
+    assert upload_steps == [2, 3]
+    assert tracker.summary["hf_resume_step"] == 3
+    assert tracker.summary["hf_resume_ref"] == "resume-3"
+    assert "[hf_resume] step=2 status=failed" in capsys.readouterr().out
+
+
+def test_train_does_not_duplicate_successful_final_interval_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.hub import HubArtifact
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+    upload_steps: list[int] = []
+
+    class TinyDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 1
+
+        def __getitem__(self, _index: int) -> dict[str, torch.Tensor]:
+            return {
+                "face": torch.zeros(6, 160, 160),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+            }
+
+    monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(path=dataset_root, provenance={"source": "local"}),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "push_resume_checkpoint",
+        lambda _path, repo_id, *, step, private: (
+            upload_steps.append(step)
+            or HubArtifact(
+                repo_id=repo_id,
+                requested_ref=f"resume-{step}",
+                resolved_ref=f"resume-{step}",
+                url=f"https://huggingface.co/{repo_id}/tree/resume-{step}",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "push_model_artifacts",
+        lambda *_args, **_kwargs: HubArtifact(
+            repo_id="owner/avatar-model",
+            requested_ref="model-ref",
+            resolved_ref="model-ref",
+        ),
+    )
+
+    training.train(
+        training.TrainConfig(
+            dataset_root=str(dataset_root),
+            manifest="manifest.jsonl",
+            run_dir=str(tmp_path / "run"),
+            init_bin="/tmp/dh_model.bin",
+            hf_model_repo="owner/avatar-model",
+            hf_resume_upload_interval=2,
+            device="cpu",
+            max_steps=2,
+            warmup_steps=0,
+            stabilization_steps=0,
+            validation_interval=10,
+            checkpoint_interval=10,
+            media_eval_on_best=False,
+        )
+    )
+
+    assert upload_steps == [2]
+
+
+def test_interrupted_and_resumed_run_matches_uninterrupted_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.hub import HubArtifact
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "manifest.jsonl").write_text("{}\n", encoding="utf-8")
+
+    class IndexedDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 3
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            return {
+                "face": torch.full((6, 160, 160), float(index) / 10.0),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+                "meta": {"sample_index": index},
+            }
+
+    monkeypatch.setattr(training, "DuixManifestDataset", IndexedDataset)
+    monkeypatch.setattr(training, "DuixUNet", _FaceAudioModel)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(
+            path=dataset_root,
+            provenance={"source": "local", "path": str(dataset_root)},
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "build_model",
+        lambda _config, _device: (
+            _FaceAudioModel(),
+            {"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "push_resume_checkpoint",
+        lambda _path, repo_id, *, step, private: HubArtifact(
+            repo_id=repo_id,
+            requested_ref=f"resume-{step}",
+            resolved_ref=f"resume-{step}",
+            url=f"https://huggingface.co/{repo_id}/tree/resume-{step}",
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "push_model_artifacts",
+        lambda *_args, **_kwargs: HubArtifact(
+            repo_id="owner/avatar-model",
+            requested_ref="model-ref",
+            resolved_ref="model-ref",
+        ),
+    )
+
+    def fresh_config(run_dir: Path, *, interval: int) -> training.TrainConfig:
+        return training.TrainConfig(
+            dataset_root=str(dataset_root),
+            manifest="manifest.jsonl",
+            run_dir=str(run_dir),
+            init_bin="/tmp/dh_model.bin",
+            hf_model_repo="owner/avatar-model",
+            hf_resume_upload_interval=interval,
+            device="cpu",
+            batch_size=1,
+            max_steps=4,
+            warmup_steps=0,
+            stabilization_steps=0,
+            validation_interval=10,
+            checkpoint_interval=10,
+            media_eval_on_best=False,
+        )
+
+    baseline_order: list[int] = []
+    original_train_step = training.run_train_step
+
+    def baseline_train_step(**kwargs: Any) -> float:
+        baseline_order.extend(
+            int(meta["sample_index"])
+            for meta in kwargs["batch"]["meta"]
+        )
+        return original_train_step(**kwargs)
+
+    monkeypatch.setattr(training, "run_train_step", baseline_train_step)
+    torch.manual_seed(42)
+    baseline_dir = tmp_path / "baseline"
+    training.train(fresh_config(baseline_dir, interval=4))
+
+    interrupted_order: list[int] = []
+    interrupted_calls = 0
+
+    def interrupted_train_step(**kwargs: Any) -> float:
+        nonlocal interrupted_calls
+        interrupted_calls += 1
+        if interrupted_calls == 3:
+            raise RuntimeError("simulated interruption")
+        interrupted_order.extend(
+            int(meta["sample_index"])
+            for meta in kwargs["batch"]["meta"]
+        )
+        return original_train_step(**kwargs)
+
+    monkeypatch.setattr(training, "run_train_step", interrupted_train_step)
+    torch.manual_seed(42)
+    interrupted_dir = tmp_path / "interrupted"
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        training.train(fresh_config(interrupted_dir, interval=2))
+    resume_checkpoint = interrupted_dir / "resume_latest.pt"
+    assert resume_checkpoint.is_file()
+
+    monkeypatch.setattr(
+        training,
+        "pull_model_checkpoint",
+        lambda repo_id, **kwargs: HubArtifact(
+            repo_id=repo_id,
+            requested_ref=str(kwargs.get("ref", "")),
+            resolved_ref="resume-2",
+            path=resume_checkpoint,
+        ),
+    )
+    resumed_order: list[int] = []
+
+    def resumed_train_step(**kwargs: Any) -> float:
+        resumed_order.extend(
+            int(meta["sample_index"])
+            for meta in kwargs["batch"]["meta"]
+        )
+        return original_train_step(**kwargs)
+
+    monkeypatch.setattr(training, "run_train_step", resumed_train_step)
+    resumed_dir = tmp_path / "resumed"
+    training.train(
+        training.TrainConfig(
+            dataset_root=str(dataset_root),
+            manifest="manifest.jsonl",
+            run_dir=str(resumed_dir),
+            resume_hf_model_repo="owner/avatar-model",
+            hf_model_repo="owner/avatar-model",
+            hf_resume_upload_interval=4,
+            device="cpu",
+            batch_size=1,
+            max_steps=4,
+            warmup_steps=0,
+            stabilization_steps=0,
+            validation_interval=10,
+            checkpoint_interval=10,
+            media_eval_on_best=False,
+        )
+    )
+
+    baseline_resume = torch.load(
+        baseline_dir / "resume_latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    resumed_resume = torch.load(
+        resumed_dir / "resume_latest.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    baseline_metrics = json.loads(
+        (baseline_dir / "metrics.json").read_text(encoding="utf-8")
+    )
+    resumed_metrics = json.loads(
+        (resumed_dir / "metrics.json").read_text(encoding="utf-8")
+    )
+
+    assert interrupted_order + resumed_order == baseline_order
+    assert resumed_metrics == baseline_metrics
+    for key, value in baseline_resume["model_state_dict"].items():
+        assert torch.equal(resumed_resume["model_state_dict"][key], value)
+    baseline_optimizer = baseline_resume["optimizer_state_dict"]
+    resumed_optimizer = resumed_resume["optimizer_state_dict"]
+    assert baseline_optimizer["param_groups"] == resumed_optimizer["param_groups"]
+    for parameter_id, baseline_state in baseline_optimizer["state"].items():
+        resumed_state = resumed_optimizer["state"][parameter_id]
+        for key, value in baseline_state.items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(resumed_state[key], value)
+            else:
+                assert resumed_state[key] == value
+
+
 def test_train_logs_writes_final_artifacts_and_publishes_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1190,6 +1588,7 @@ def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import edge_lipsync.training as training
+    from edge_lipsync.hub import HubArtifact
     from edge_lipsync.sources import ResolvedSource
 
     dataset_root = tmp_path / "dataset"
@@ -1230,6 +1629,7 @@ def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
 
     tracker = FakeTracker()
     validation_losses = iter((1.0, 0.95, 0.94))
+    resume_payloads: list[dict[str, Any]] = []
 
     monkeypatch.setattr(training, "DuixManifestDataset", TinyDataset)
     monkeypatch.setattr(
@@ -1257,6 +1657,29 @@ def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
             "val_temporal_delta": 0.0,
         },
     )
+    monkeypatch.setattr(
+        training,
+        "push_resume_checkpoint",
+        lambda path, repo_id, *, step, private: (
+            resume_payloads.append(
+                torch.load(path, map_location="cpu", weights_only=False)
+            )
+            or HubArtifact(
+                repo_id=repo_id,
+                requested_ref=f"resume-{step}",
+                resolved_ref=f"resume-{step}",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "push_model_artifacts",
+        lambda *_args, **_kwargs: HubArtifact(
+            repo_id="owner/avatar-model",
+            requested_ref="model-ref",
+            resolved_ref="model-ref",
+        ),
+    )
 
     training.train(
         training.TrainConfig(
@@ -1264,6 +1687,8 @@ def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
             manifest="manifest.jsonl",
             run_dir=str(run_dir),
             init_bin="/tmp/dh_model.bin",
+            hf_model_repo="owner/avatar-model",
+            hf_resume_upload_interval=10,
             device="cpu",
             max_steps=5,
             warmup_steps=0,
@@ -1287,6 +1712,10 @@ def test_train_stops_early_when_val_loss_does_not_improve_by_min_delta(
     assert tracker.summary["early_stop_reason"] == "val_loss_patience"
     assert tracker.summary["early_stop_step"] == 2
     assert tracker.exit_codes == [0]
+    assert len(resume_payloads) == 1
+    assert resume_payloads[0]["step"] == 2
+    assert resume_payloads[0]["early_stop_reason"] == "val_loss_patience"
+    assert resume_payloads[0]["early_stop_step"] == 2
 
 
 def test_train_finishes_tracker_with_error_code_when_step_fails(

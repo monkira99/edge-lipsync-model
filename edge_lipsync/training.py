@@ -809,6 +809,104 @@ def _checkpoint_payload(
     )
 
 
+def _save_and_upload_resume_checkpoint(
+    *,
+    run_dir: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    config: TrainConfig,
+    dataset_identity: dict[str, Any],
+    dataset_root: Path,
+    manifest_path: Path,
+    device: torch.device,
+    mixed_precision: bool,
+    step: int,
+    epoch: int,
+    next_batch_index: int,
+    epoch_sample_indices: list[int],
+    data_order_generator: torch.Generator,
+    best_val_loss: float,
+    early_stopping_best_val_loss: float,
+    validations_without_improvement: int,
+    early_stop_reason: str,
+    early_stop_step: int,
+    best_metrics: dict[str, float | int | str] | None,
+    best_model_state_dict: dict[str, torch.Tensor],
+    metrics: list[dict[str, float | int | str]],
+    init_weight_source: dict[str, Any],
+    provenance: dict[str, Any],
+    tracker: Any,
+) -> HubArtifact | None:
+    resume_path = run_dir / "resume_latest.pt"
+    payload = make_training_resume_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        training_config=asdict(config),
+        dataset_identity=dataset_identity,
+        dataset_root=dataset_root,
+        manifest_path=manifest_path,
+        runtime={
+            "device_type": device.type,
+            "mixed_precision": mixed_precision,
+        },
+        step=step,
+        epoch=epoch,
+        next_batch_index=next_batch_index,
+        epoch_sample_indices=epoch_sample_indices,
+        data_order_generator_state=data_order_generator.get_state(),
+        best_val_loss=best_val_loss,
+        early_stopping_best_val_loss=early_stopping_best_val_loss,
+        validations_without_improvement=validations_without_improvement,
+        early_stop_reason=early_stop_reason,
+        early_stop_step=early_stop_step,
+        best_metrics=best_metrics,
+        best_model_state_dict=best_model_state_dict,
+        metrics_history=metrics,
+        random_state=capture_random_state(),
+        init_weight_source=init_weight_source,
+        provenance=provenance,
+    )
+    atomic_torch_save(payload, resume_path)
+    print(
+        f"[hf_resume] step={step} status=start repo={config.hf_model_repo}",
+        flush=True,
+    )
+    try:
+        artifact = push_resume_checkpoint(
+            resume_path,
+            config.hf_model_repo,
+            step=step,
+            private=config.hf_model_private,
+        )
+    except Exception as exc:
+        print(
+            "[hf_resume] "
+            f"step={step} status=failed repo={config.hf_model_repo} error={exc}",
+            flush=True,
+        )
+        try:
+            tracker.log_metrics({"hf_resume_upload_ok": 0}, step=step)
+        except Exception:
+            pass
+        return None
+
+    print(
+        f"[hf_resume] step={step} status=uploaded ref={artifact.resolved_ref}",
+        flush=True,
+    )
+    tracker.log_metrics({"hf_resume_upload_ok": 1}, step=step)
+    tracker.update_summary(
+        {
+            "hf_resume_step": step,
+            "hf_resume_ref": artifact.resolved_ref,
+            "hf_resume_url": artifact.url,
+        }
+    )
+    return artifact
+
+
 def _render_best_media_eval(
     *,
     model: torch.nn.Module,
@@ -1180,9 +1278,41 @@ def train(config: TrainConfig) -> Path:
             data_order_generator.manual_seed(torch.initial_seed())
             epoch_sample_indices = []
             next_batch_index = 0
+        last_successful_resume_upload_step = 0
     except Exception:
         tracker.finish(exit_code=1)
         raise
+
+    def save_current_resume_checkpoint() -> HubArtifact | None:
+        return _save_and_upload_resume_checkpoint(
+            run_dir=run_dir,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            config=config,
+            dataset_identity=dataset_identity,
+            dataset_root=dataset_root,
+            manifest_path=manifest_path,
+            device=device,
+            mixed_precision=mixed_precision,
+            step=step,
+            epoch=epoch,
+            next_batch_index=next_batch_index,
+            epoch_sample_indices=epoch_sample_indices,
+            data_order_generator=data_order_generator,
+            best_val_loss=best_val_loss,
+            early_stopping_best_val_loss=early_stopping_best_val_loss,
+            validations_without_improvement=validations_without_improvement,
+            early_stop_reason=early_stop_reason,
+            early_stop_step=early_stop_step,
+            best_metrics=best_metrics,
+            best_model_state_dict=best_model_state_dict,
+            metrics=metrics,
+            init_weight_source=init_weight_source,
+            provenance=provenance,
+            tracker=tracker,
+        )
+
     try:
         while step < config.max_steps and not early_stop_reason:
             epoch_batch_count = (
@@ -1360,11 +1490,19 @@ def train(config: TrainConfig) -> Path:
                     log_interval=config.log_interval,
                 ):
                     print(_format_training_log(row, max_steps=config.max_steps), flush=True)
+                if (
+                    config.hf_resume_upload_interval > 0
+                    and step % config.hf_resume_upload_interval == 0
+                ):
+                    resume_artifact = save_current_resume_checkpoint()
+                    if resume_artifact is not None:
+                        last_successful_resume_upload_step = step
                 if early_stop_reason or step >= config.max_steps:
                     break
 
         _write_metrics(metrics, run_dir)
         if not best_path.exists():
+            best_model_state_dict = clone_state_dict_to_cpu(model.state_dict())
             atomic_torch_save(
                 _checkpoint_payload(
                     model=model,
@@ -1394,6 +1532,13 @@ def train(config: TrainConfig) -> Path:
             ),
             final_path,
         )
+        if (
+            config.hf_resume_upload_interval > 0
+            and last_successful_resume_upload_step != step
+        ):
+            resume_artifact = save_current_resume_checkpoint()
+            if resume_artifact is not None:
+                last_successful_resume_upload_step = step
         write_run_metadata(
             run_dir,
             provenance=provenance,
