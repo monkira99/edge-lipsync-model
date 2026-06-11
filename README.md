@@ -386,6 +386,43 @@ hf_model_repo: username/avatar-name-model
 hf_model_private: true
 ```
 
+To also publish a complete recovery checkpoint every 1000 optimizer steps, set:
+
+```yaml
+hf_model_repo: username/avatar-name-model
+hf_resume_upload_interval: 1000
+```
+
+The trainer atomically writes `run_dir/resume_latest.pt`, then replaces
+`resume/latest.pt` in the model repository. The checkpoint contains model, optimizer, GradScaler,
+step/epoch, exact data-order cursor, metrics, best-model, early-stopping, and random-number
+generator state. A failed Hub upload prints an `[hf_resume] ... status=failed` row and training
+continues; the next interval and final step try again. Local checkpoint write failures remain
+fatal.
+
+Resume is explicit. Start a new invocation with the same dataset and trajectory-critical training
+settings, clear every initialization source, and set:
+
+```yaml
+init_bin: ""
+init_ckpt: ""
+hf_init_model_repo: ""
+resume_hf_model_repo: username/avatar-name-model
+resume_hf_model_revision: ""  # Default branch, or pin an older commit/tag.
+hf_model_repo: username/avatar-name-model
+hf_resume_upload_interval: 1000
+max_steps: 10000  # The original total target, not additional steps.
+```
+
+Resume starts a new W&B run and records the source Hub commit in provenance. It requires the same
+dataset identity, resolved device type, mixed-precision mode, optimizer/loss schedule, validation
+cadence, early-stopping settings, and `max_steps`. Use `init_ckpt` instead when intentionally
+changing the schedule or extending a completed run.
+
+Only one `resume/latest.pt` path appears in the current repository tree. Replacing it creates Hub
+commits, so older large-file blobs can remain in repository history and continue using storage.
+The trainer does not rewrite or squash Hub history.
+
 Supported W&B modes are `disabled`, `offline`, and `online`. Local metrics remain available in
 all modes. W&B records configuration, per-step losses, validation metrics, phase, learning rate,
 Hub provenance, console output, and native system telemetry. Best-checkpoint MP4s are logged to W&B

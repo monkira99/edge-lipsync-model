@@ -11,6 +11,9 @@ hf_init_model_repo: ""
 hf_init_model_filename: best.pt
 hf_model_repo: ""
 hf_model_private: true
+hf_resume_upload_interval: 0
+resume_hf_model_repo: ""
+resume_hf_model_revision: ""
 device: auto
 precision: auto
 batch_size: 2
