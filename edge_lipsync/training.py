@@ -81,6 +81,9 @@ class TrainConfig:
     hf_init_model_filename: str = "best.pt"
     hf_model_repo: str = ""
     hf_model_private: bool = True
+    hf_resume_upload_interval: int = 0
+    resume_hf_model_repo: str = ""
+    resume_hf_model_revision: str = ""
     wandb_mode: str = "disabled"
     wandb_project: str = "edge-lipsync-model"
     wandb_entity: str = ""
@@ -107,6 +110,25 @@ class MediaEvalSelection:
     indices: tuple[int, ...]
 
 
+TRAJECTORY_CRITICAL_FIELDS = (
+    "batch_size",
+    "learning_rate",
+    "weight_decay",
+    "max_steps",
+    "warmup_steps",
+    "stabilization_steps",
+    "stabilization_lr_scale",
+    "validation_interval",
+    "lpips_enabled",
+    "lpips_net",
+    "lpips_face_loss_weight",
+    "lpips_mouth_loss_weight",
+    "early_stopping_patience",
+    "early_stopping_min_delta",
+    "precision",
+)
+
+
 def resolve_device(requested: str) -> torch.device:
     if requested != "auto":
         return torch.device(requested)
@@ -123,6 +145,102 @@ def use_mixed_precision(config: TrainConfig, device: torch.device) -> bool:
     if config.precision == "mixed" and device.type != "cuda":
         raise ValueError("precision='mixed' requires a CUDA device")
     return device.type == "cuda" and config.precision in {"auto", "mixed"}
+
+
+def validate_training_config(config: TrainConfig) -> None:
+    if config.max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    if config.validation_interval <= 0 or config.checkpoint_interval <= 0:
+        raise ValueError("validation_interval and checkpoint_interval must be positive")
+    if config.log_interval < 0:
+        raise ValueError("log_interval must be >= 0")
+    if config.lpips_net not in {"alex", "vgg", "squeeze"}:
+        raise ValueError(f"Unsupported lpips_net={config.lpips_net!r}")
+    if config.lpips_face_loss_weight < 0 or config.lpips_mouth_loss_weight < 0:
+        raise ValueError("LPIPS loss weights must be non-negative")
+    if config.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be >= 0")
+    if config.early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0")
+    if config.media_eval_on_best and config.media_eval_fps <= 0:
+        raise ValueError("media_eval_fps must be positive")
+    if config.hf_resume_upload_interval < 0:
+        raise ValueError("hf_resume_upload_interval must be >= 0")
+    if config.hf_resume_upload_interval > 0 and not config.hf_model_repo:
+        raise ValueError("hf_model_repo is required when hf_resume_upload_interval is positive")
+
+    initialization_sources = (
+        config.init_bin,
+        config.init_ckpt,
+        config.hf_init_model_repo,
+    )
+    if config.resume_hf_model_repo:
+        if any(initialization_sources):
+            raise ValueError(
+                "Resume mode does not accept init_bin, init_ckpt, or hf_init_model_repo"
+            )
+    elif sum(bool(value) for value in initialization_sources) != 1:
+        raise ValueError("Set exactly one of init_bin, init_ckpt, or hf_init_model_repo")
+
+
+def dataset_identity_for_training(
+    prepared: PreparedTrainingDatasets,
+) -> dict[str, Any]:
+    provenance = prepared.provenance
+    fingerprints = provenance.get("fingerprints")
+    if isinstance(fingerprints, dict):
+        return {
+            "kind": "huggingface",
+            "repo_id": str(provenance.get("repo_id", "")),
+            "resolved_ref": str(provenance.get("resolved_ref", "")),
+            "fingerprints": dict(fingerprints),
+        }
+    return {
+        "kind": "manifest",
+        "manifest_sha256": manifest_sha256(prepared.manifest_path),
+    }
+
+
+def validate_resume_compatibility(
+    checkpoint: dict[str, Any],
+    *,
+    config: TrainConfig,
+    dataset_identity: dict[str, Any],
+    device: torch.device,
+    mixed_precision: bool,
+) -> None:
+    saved_config = checkpoint["training_config"]
+    mismatches = [
+        field
+        for field in TRAJECTORY_CRITICAL_FIELDS
+        if saved_config.get(field) != getattr(config, field)
+    ]
+    if mismatches:
+        raise ValueError(
+            "Resume checkpoint training config mismatch: "
+            + ", ".join(sorted(mismatches))
+        )
+    if checkpoint["dataset_identity"] != dataset_identity:
+        raise ValueError("Dataset identity does not match resume checkpoint")
+
+    runtime = checkpoint["runtime"]
+    saved_device_type = str(runtime.get("device_type", ""))
+    if saved_device_type != device.type:
+        raise ValueError(
+            "Resume checkpoint device type mismatch: "
+            f"saved={saved_device_type!r} current={device.type!r}"
+        )
+    saved_mixed_precision = bool(runtime.get("mixed_precision", False))
+    if saved_mixed_precision != mixed_precision:
+        raise ValueError(
+            "Resume checkpoint mixed precision mode does not match current runtime"
+        )
+    step = int(checkpoint["step"])
+    if step >= config.max_steps:
+        raise ValueError(
+            f"Resume checkpoint already reached max_steps: step={step} "
+            f"max_steps={config.max_steps}"
+        )
 
 
 def validate_batch_shapes(batch: dict[str, Any]) -> None:
@@ -780,22 +898,7 @@ def prepare_training_datasets(
 
 
 def train(config: TrainConfig) -> Path:
-    if config.max_steps <= 0:
-        raise ValueError("max_steps must be positive")
-    if config.validation_interval <= 0 or config.checkpoint_interval <= 0:
-        raise ValueError("validation_interval and checkpoint_interval must be positive")
-    if config.log_interval < 0:
-        raise ValueError("log_interval must be >= 0")
-    if config.lpips_net not in {"alex", "vgg", "squeeze"}:
-        raise ValueError(f"Unsupported lpips_net={config.lpips_net!r}")
-    if config.lpips_face_loss_weight < 0 or config.lpips_mouth_loss_weight < 0:
-        raise ValueError("LPIPS loss weights must be non-negative")
-    if config.early_stopping_patience < 0:
-        raise ValueError("early_stopping_patience must be >= 0")
-    if config.early_stopping_min_delta < 0:
-        raise ValueError("early_stopping_min_delta must be >= 0")
-    if config.media_eval_on_best and config.media_eval_fps <= 0:
-        raise ValueError("media_eval_fps must be positive")
+    validate_training_config(config)
     run_dir = Path(config.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     prepared_data = prepare_training_datasets(config, run_dir=run_dir)

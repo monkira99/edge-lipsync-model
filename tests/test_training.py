@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -263,6 +264,166 @@ def test_mixed_precision_rejects_cpu_device() -> None:
 
     with pytest.raises(ValueError, match="CUDA"):
         use_mixed_precision(config, torch.device("cpu"))
+
+
+def test_validate_training_config_rejects_resume_with_initialization_source() -> None:
+    from edge_lipsync.training import TrainConfig, validate_training_config
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        run_dir="run",
+        init_bin="/tmp/dh_model.bin",
+        resume_hf_model_repo="owner/model",
+    )
+
+    with pytest.raises(ValueError, match="Resume mode does not accept"):
+        validate_training_config(config)
+
+
+def test_validate_training_config_requires_model_repo_for_resume_uploads() -> None:
+    from edge_lipsync.training import TrainConfig, validate_training_config
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        run_dir="run",
+        init_bin="/tmp/dh_model.bin",
+        hf_resume_upload_interval=1000,
+    )
+
+    with pytest.raises(ValueError, match="hf_model_repo"):
+        validate_training_config(config)
+
+
+def test_dataset_identity_uses_manifest_hash_for_local_dataset(tmp_path: Path) -> None:
+    from edge_lipsync.training import PreparedTrainingDatasets, dataset_identity_for_training
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"clip_id":"clip"}\n', encoding="utf-8")
+    prepared = PreparedTrainingDatasets(
+        train_dataset=[],
+        val_dataset=[],
+        dataset_root=tmp_path,
+        manifest_path=manifest,
+        provenance={"source": "local"},
+    )
+
+    identity = dataset_identity_for_training(prepared)
+
+    assert identity["kind"] == "manifest"
+    assert identity["manifest_sha256"]
+
+
+def test_dataset_identity_uses_hub_revision_and_fingerprints(tmp_path: Path) -> None:
+    from edge_lipsync.training import PreparedTrainingDatasets, dataset_identity_for_training
+
+    prepared = PreparedTrainingDatasets(
+        train_dataset=[],
+        val_dataset=[],
+        dataset_root=tmp_path,
+        manifest_path=tmp_path / "hf_dataset_source.json",
+        provenance={
+            "source": "huggingface_snapshot",
+            "repo_id": "owner/dataset",
+            "resolved_ref": "dataset-sha",
+            "fingerprints": {"train": "train-fp", "val": "val-fp"},
+        },
+    )
+
+    assert dataset_identity_for_training(prepared) == {
+        "kind": "huggingface",
+        "repo_id": "owner/dataset",
+        "resolved_ref": "dataset-sha",
+        "fingerprints": {"train": "train-fp", "val": "val-fp"},
+    }
+
+
+def test_validate_resume_compatibility_rejects_critical_config_mismatch() -> None:
+    from edge_lipsync.training import TrainConfig, validate_resume_compatibility
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        run_dir="run",
+        resume_hf_model_repo="owner/model",
+        max_steps=10,
+        batch_size=2,
+    )
+    checkpoint = {
+        "training_config": {**asdict(config), "batch_size": 4},
+        "dataset_identity": {"kind": "manifest", "manifest_sha256": "abc"},
+        "runtime": {"device_type": "cpu", "mixed_precision": False},
+        "step": 5,
+    }
+
+    with pytest.raises(ValueError, match="batch_size"):
+        validate_resume_compatibility(
+            checkpoint,
+            config=config,
+            dataset_identity={"kind": "manifest", "manifest_sha256": "abc"},
+            device=torch.device("cpu"),
+            mixed_precision=False,
+        )
+
+
+def test_validate_resume_compatibility_rejects_dataset_and_runtime_mismatch() -> None:
+    from edge_lipsync.training import TrainConfig, validate_resume_compatibility
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        run_dir="run",
+        resume_hf_model_repo="owner/model",
+        max_steps=10,
+    )
+    checkpoint = {
+        "training_config": asdict(config),
+        "dataset_identity": {"kind": "manifest", "manifest_sha256": "old"},
+        "runtime": {"device_type": "cuda", "mixed_precision": True},
+        "step": 5,
+    }
+
+    with pytest.raises(ValueError, match="Dataset identity"):
+        validate_resume_compatibility(
+            checkpoint,
+            config=config,
+            dataset_identity={"kind": "manifest", "manifest_sha256": "new"},
+            device=torch.device("cpu"),
+            mixed_precision=False,
+        )
+
+    checkpoint["dataset_identity"] = {"kind": "manifest", "manifest_sha256": "new"}
+    with pytest.raises(ValueError, match="device type"):
+        validate_resume_compatibility(
+            checkpoint,
+            config=config,
+            dataset_identity={"kind": "manifest", "manifest_sha256": "new"},
+            device=torch.device("cpu"),
+            mixed_precision=False,
+        )
+
+
+def test_validate_resume_compatibility_rejects_completed_checkpoint() -> None:
+    from edge_lipsync.training import TrainConfig, validate_resume_compatibility
+
+    config = TrainConfig(
+        dataset_root="dataset",
+        run_dir="run",
+        resume_hf_model_repo="owner/model",
+        max_steps=10,
+    )
+    checkpoint = {
+        "training_config": asdict(config),
+        "dataset_identity": {"kind": "manifest", "manifest_sha256": "abc"},
+        "runtime": {"device_type": "cpu", "mixed_precision": False},
+        "step": 10,
+    }
+
+    with pytest.raises(ValueError, match="already reached"):
+        validate_resume_compatibility(
+            checkpoint,
+            config=config,
+            dataset_identity={"kind": "manifest", "manifest_sha256": "abc"},
+            device=torch.device("cpu"),
+            mixed_precision=False,
+        )
 
 
 def test_build_model_rejects_missing_init_checkpoint(tmp_path: Path) -> None:
