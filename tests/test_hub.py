@@ -26,6 +26,7 @@ class _FakeApi:
     def __init__(self, *, dataset_sha: str = "dataset-sha") -> None:
         self.created: list[dict[str, Any]] = []
         self.uploads: list[dict[str, Any]] = []
+        self.file_uploads: list[dict[str, Any]] = []
         self.large_uploads: list[dict[str, Any]] = []
         self.dataset_sha = dataset_sha
 
@@ -40,6 +41,10 @@ class _FakeApi:
         self.uploads.append(kwargs)
         repo_type = kwargs.get("repo_type")
         return _Commit("dataset-commit" if repo_type == "dataset" else "model-commit")
+
+    def upload_file(self, **kwargs: Any) -> _Commit:
+        self.file_uploads.append(kwargs)
+        return _Commit("resume-commit")
 
     def upload_large_folder(self, **kwargs: Any) -> None:
         self.large_uploads.append(kwargs)
@@ -97,6 +102,38 @@ def test_push_model_artifacts_uses_model_allowlist(tmp_path: Path) -> None:
     ]
     assert api.uploads[0]["allow_patterns"] == MODEL_UPLOAD_PATTERNS
     assert "repo_type" not in api.uploads[0]
+
+
+def test_push_resume_checkpoint_replaces_latest_file(tmp_path: Path) -> None:
+    from edge_lipsync.hub import push_resume_checkpoint
+
+    checkpoint = tmp_path / "resume_latest.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    api = _FakeApi()
+
+    result = push_resume_checkpoint(
+        checkpoint,
+        "owner/avatar-model",
+        step=1000,
+        api=api,
+    )
+
+    assert result.resolved_ref == "resume-commit"
+    assert api.created == [
+        {
+            "repo_id": "owner/avatar-model",
+            "private": True,
+            "exist_ok": True,
+        }
+    ]
+    assert api.file_uploads == [
+        {
+            "path_or_fileobj": str(checkpoint),
+            "path_in_repo": "resume/latest.pt",
+            "repo_id": "owner/avatar-model",
+            "commit_message": "Update resume checkpoint at step 1000",
+        }
+    ]
 
 
 def test_push_model_assets_uploads_assets_allowlist(tmp_path: Path) -> None:

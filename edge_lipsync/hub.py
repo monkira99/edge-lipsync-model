@@ -116,6 +116,34 @@ def push_model_artifacts(
     )
 
 
+def push_resume_checkpoint(
+    checkpoint_path: str | Path,
+    repo_id: str,
+    *,
+    step: int,
+    private: bool = True,
+    api: Any | None = None,
+) -> HubArtifact:
+    checkpoint = Path(checkpoint_path)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    client = _client(api)
+    client.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+    commit = client.upload_file(
+        path_or_fileobj=str(checkpoint),
+        path_in_repo="resume/latest.pt",
+        repo_id=repo_id,
+        commit_message=f"Update resume checkpoint at step {step}",
+    )
+    ref = str(commit.oid)
+    return HubArtifact(
+        repo_id=repo_id,
+        requested_ref=ref,
+        resolved_ref=ref,
+        url=_repo_url(repo_id, repo_type="model", ref=ref),
+    )
+
+
 def pull_model_checkpoint(
     repo_id: str,
     *,
