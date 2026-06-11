@@ -12,10 +12,25 @@ import torch
 from datasets import load_from_disk
 from torch.utils.data import DataLoader, Subset, default_collate
 
-from edge_lipsync.checkpoint import atomic_torch_save, make_training_checkpoint
+from edge_lipsync.checkpoint import (
+    atomic_torch_save,
+    capture_random_state,
+    clone_state_dict_to_cpu,
+    load_training_resume_checkpoint,
+    make_training_checkpoint,
+    make_training_checkpoint_from_state_dict,
+    make_training_resume_checkpoint,
+    restore_random_state,
+)
 from edge_lipsync.dataset import DuixHFDataset, DuixManifestDataset, manifest_sha256
 from edge_lipsync.eval import render_validation_artifacts
-from edge_lipsync.hub import HubArtifact, pull_dataset_snapshot, push_model_artifacts
+from edge_lipsync.hub import (
+    HubArtifact,
+    pull_dataset_snapshot,
+    pull_model_checkpoint,
+    push_model_artifacts,
+    push_resume_checkpoint,
+)
 from edge_lipsync.losses import (
     charbonnier_loss,
     combined_reconstruction_loss,
@@ -547,6 +562,41 @@ def build_model(config: TrainConfig, device: torch.device) -> tuple[DuixUNet, di
     }
 
 
+def build_model_from_resume(
+    checkpoint: dict[str, Any],
+    device: torch.device,
+) -> DuixUNet:
+    model = DuixUNet().to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    return model
+
+
+def _move_optimizer_value_to_device(value: Any, device: torch.device) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {
+            key: _move_optimizer_value_to_device(item, device)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_move_optimizer_value_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_optimizer_value_to_device(item, device) for item in value)
+    return value
+
+
+def restore_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    state_dict: dict[str, Any],
+    *,
+    device: torch.device,
+) -> None:
+    optimizer.load_state_dict(state_dict)
+    for parameter, state in optimizer.state.items():
+        optimizer.state[parameter] = _move_optimizer_value_to_device(state, device)
+
+
 def _write_metrics(metrics: list[dict[str, float | int | str]], run_dir: Path) -> None:
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     fieldnames = sorted({key for row in metrics for key in row})
@@ -936,8 +986,41 @@ def train(config: TrainConfig) -> Path:
     )
     dataset_root = prepared_data.dataset_root
     manifest_path = prepared_data.manifest_path
+    dataset_identity = dataset_identity_for_training(prepared_data)
     device = resolve_device(config.device)
-    model, init_weight_source = build_model(config, device)
+    mixed_precision = use_mixed_precision(config, device)
+    resume_checkpoint: dict[str, Any] | None = None
+    resume_provenance: dict[str, Any] | None = None
+    if config.resume_hf_model_repo:
+        resume_artifact = pull_model_checkpoint(
+            config.resume_hf_model_repo,
+            ref=config.resume_hf_model_revision,
+            filename="resume/latest.pt",
+            cache_dir=config.hf_cache_dir,
+        )
+        if resume_artifact.path is None:
+            raise ValueError("Resume checkpoint download returned no local path")
+        resume_checkpoint = load_training_resume_checkpoint(resume_artifact.path)
+        validate_resume_compatibility(
+            resume_checkpoint,
+            config=config,
+            dataset_identity=dataset_identity,
+            device=device,
+            mixed_precision=mixed_precision,
+        )
+        model = build_model_from_resume(resume_checkpoint, device)
+        init_weight_source = dict(resume_checkpoint["init_weight_source"])
+        resume_provenance = {
+            "source": "huggingface",
+            "repo_id": resume_artifact.repo_id,
+            "requested_ref": resume_artifact.requested_ref,
+            "resolved_ref": resume_artifact.resolved_ref,
+            "filename": "resume/latest.pt",
+            "url": resume_artifact.url,
+            "path": str(resume_artifact.path),
+        }
+    else:
+        model, init_weight_source = build_model(config, device)
     lpips_evaluator = (
         LPIPSEvaluator(device, net=config.lpips_net)
         if config.lpips_enabled
@@ -949,6 +1032,8 @@ def train(config: TrainConfig) -> Path:
         "dataset": prepared_data.provenance,
         "init_model": init_weight_source,
     }
+    if resume_provenance is not None:
+        provenance["resume"] = resume_provenance
     if media_eval_selection is not None:
         provenance["media_eval"] = {
             "on_best": True,
@@ -964,7 +1049,6 @@ def train(config: TrainConfig) -> Path:
     )
     provenance["wandb"] = tracker.provenance
     try:
-        mixed_precision = use_mixed_precision(config, device)
         shape_loader = DataLoader(
             prepared_data.train_dataset,
             batch_size=config.batch_size,
@@ -987,6 +1071,13 @@ def train(config: TrainConfig) -> Path:
             weight_decay=config.weight_decay,
         )
         scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision)
+        if resume_checkpoint is not None:
+            restore_optimizer_state(
+                optimizer,
+                resume_checkpoint["optimizer_state_dict"],
+                device=device,
+            )
+            scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
 
         def training_loss(
             pred: torch.Tensor,
@@ -1003,21 +1094,92 @@ def train(config: TrainConfig) -> Path:
                 sample_weight=sample_weight,
             )
 
-        metrics: list[dict[str, float | int | str]] = []
+        metrics: list[dict[str, float | int | str]] = (
+            [dict(row) for row in resume_checkpoint["metrics_history"]]
+            if resume_checkpoint is not None
+            else []
+        )
         media_eval_artifacts: list[dict[str, Any]] = []
-        best_val_loss = float("inf")
-        early_stopping_best_val_loss = float("inf")
-        best_metrics: dict[str, float | int | str] | None = None
-        validations_without_improvement = 0
-        early_stop_reason = ""
-        early_stop_step = 0
+        best_val_loss = (
+            float(resume_checkpoint["best_val_loss"])
+            if resume_checkpoint is not None
+            else float("inf")
+        )
+        early_stopping_best_val_loss = (
+            float(resume_checkpoint["early_stopping_best_val_loss"])
+            if resume_checkpoint is not None
+            else float("inf")
+        )
+        best_metrics: dict[str, float | int | str] | None = (
+            dict(resume_checkpoint["best_metrics"])
+            if resume_checkpoint is not None
+            and resume_checkpoint["best_metrics"] is not None
+            else None
+        )
+        best_model_state_dict = (
+            clone_state_dict_to_cpu(resume_checkpoint["best_model_state_dict"])
+            if resume_checkpoint is not None
+            else clone_state_dict_to_cpu(model.state_dict())
+        )
+        validations_without_improvement = (
+            int(resume_checkpoint["validations_without_improvement"])
+            if resume_checkpoint is not None
+            else 0
+        )
+        early_stop_reason = (
+            str(resume_checkpoint["early_stop_reason"])
+            if resume_checkpoint is not None
+            else ""
+        )
+        early_stop_step = (
+            int(resume_checkpoint["early_stop_step"])
+            if resume_checkpoint is not None
+            else 0
+        )
         best_path = run_dir / "best.pt"
-        step = 0
-        epoch = 0
+        step = int(resume_checkpoint["step"]) if resume_checkpoint is not None else 0
+        epoch = int(resume_checkpoint["epoch"]) if resume_checkpoint is not None else 0
         active_phase = ""
-        data_order_generator = torch.Generator().manual_seed(torch.initial_seed())
-        epoch_sample_indices: list[int] = []
-        next_batch_index = 0
+        data_order_generator = torch.Generator()
+        if resume_checkpoint is not None:
+            data_order_generator.set_state(
+                resume_checkpoint["data_order_generator_state"]
+            )
+            epoch_sample_indices = [
+                int(index) for index in resume_checkpoint["epoch_sample_indices"]
+            ]
+            next_batch_index = int(resume_checkpoint["next_batch_index"])
+            restore_random_state(resume_checkpoint["random_state"])
+            if best_metrics is not None:
+                best_numeric_metrics = {
+                    key: value
+                    for key, value in best_metrics.items()
+                    if isinstance(value, (float, int))
+                }
+                atomic_torch_save(
+                    make_training_checkpoint_from_state_dict(
+                        state_dict=best_model_state_dict,
+                        training_config=asdict(config),
+                        dataset_root=dataset_root,
+                        manifest_path=manifest_path,
+                        step=int(best_metrics["step"]),
+                        epoch=int(best_metrics["epoch"]),
+                        metrics=best_numeric_metrics,
+                        init_weight_source=init_weight_source,
+                        provenance=provenance,
+                    ),
+                    best_path,
+                )
+            print(
+                "[resume] "
+                f"step={step} epoch={epoch} next_batch={next_batch_index} "
+                f"ref={resume_provenance['resolved_ref'] if resume_provenance else ''}",
+                flush=True,
+            )
+        else:
+            data_order_generator.manual_seed(torch.initial_seed())
+            epoch_sample_indices = []
+            next_batch_index = 0
     except Exception:
         tracker.finish(exit_code=1)
         raise
@@ -1101,6 +1263,9 @@ def train(config: TrainConfig) -> Path:
                     if checkpoint_improved:
                         best_val_loss = val_loss
                         best_metrics = dict(row)
+                        best_model_state_dict = clone_state_dict_to_cpu(
+                            model.state_dict()
+                        )
                     if early_stopping_improved:
                         early_stopping_best_val_loss = val_loss
                         validations_without_improvement = 0

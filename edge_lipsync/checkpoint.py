@@ -31,6 +31,8 @@ RESUME_REQUIRED_FIELDS = {
     "best_val_loss",
     "early_stopping_best_val_loss",
     "validations_without_improvement",
+    "early_stop_reason",
+    "early_stop_step",
     "best_metrics",
     "best_model_state_dict",
     "metrics_history",
@@ -108,10 +110,35 @@ def make_training_checkpoint(
     init_weight_source: dict[str, Any],
     provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    return make_training_checkpoint_from_state_dict(
+        state_dict=model.state_dict(),
+        training_config=training_config,
+        dataset_root=dataset_root,
+        manifest_path=manifest_path,
+        step=step,
+        epoch=epoch,
+        metrics=metrics,
+        init_weight_source=init_weight_source,
+        provenance=provenance,
+    )
+
+
+def make_training_checkpoint_from_state_dict(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    training_config: dict[str, Any],
+    dataset_root: str | Path,
+    manifest_path: str | Path,
+    step: int,
+    epoch: int,
+    metrics: dict[str, float | int],
+    init_weight_source: dict[str, Any],
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     manifest = Path(manifest_path)
     return {
         "format": TRAIN_CHECKPOINT_FORMAT,
-        "state_dict": model.state_dict(),
+        "state_dict": clone_state_dict_to_cpu(state_dict),
         "training_config": training_config,
         "dataset_root": str(Path(dataset_root).resolve()),
         "manifest_path": str(manifest.resolve()),
@@ -148,6 +175,8 @@ def make_training_resume_checkpoint(
     random_state: dict[str, Any],
     init_weight_source: dict[str, Any],
     provenance: dict[str, Any],
+    early_stop_reason: str = "",
+    early_stop_step: int = 0,
 ) -> dict[str, Any]:
     return {
         "format": RESUME_CHECKPOINT_FORMAT,
@@ -167,6 +196,8 @@ def make_training_resume_checkpoint(
         "best_val_loss": float(best_val_loss),
         "early_stopping_best_val_loss": float(early_stopping_best_val_loss),
         "validations_without_improvement": int(validations_without_improvement),
+        "early_stop_reason": str(early_stop_reason),
+        "early_stop_step": int(early_stop_step),
         "best_metrics": dict(best_metrics) if best_metrics is not None else None,
         "best_model_state_dict": clone_state_dict_to_cpu(best_model_state_dict),
         "metrics_history": [dict(row) for row in metrics_history],

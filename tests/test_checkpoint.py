@@ -208,6 +208,33 @@ def test_make_model_checkpoint_from_state_dict_clones_weights() -> None:
     assert payload["extra"] == {"step": 3}
 
 
+def test_make_training_checkpoint_from_state_dict_preserves_metadata(tmp_path: Path) -> None:
+    from edge_lipsync.checkpoint import make_training_checkpoint_from_state_dict
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text('{"clip_id":"clip"}\n', encoding="utf-8")
+    state = {"weight": torch.tensor([1.0])}
+
+    payload = make_training_checkpoint_from_state_dict(
+        state_dict=state,
+        training_config={"max_steps": 10},
+        dataset_root=tmp_path,
+        manifest_path=manifest,
+        step=3,
+        epoch=2,
+        metrics={"val_loss": 0.1},
+        init_weight_source={"kind": "ncnn_bin"},
+        provenance={"dataset": {"source": "local"}},
+    )
+    state["weight"].fill_(2.0)
+
+    assert payload["format"] == "edge_lipsync_duix_unet_train_v1"
+    assert payload["state_dict"]["weight"].tolist() == [1.0]
+    assert payload["step"] == 3
+    assert payload["epoch"] == 2
+    assert payload["metrics"] == {"val_loss": 0.1}
+
+
 def test_export_checkpoint_cli_help() -> None:
     result = subprocess.run(
         [sys.executable, "tools/export_checkpoint.py", "--help"],

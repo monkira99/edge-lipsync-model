@@ -505,6 +505,177 @@ def test_build_model_loads_hub_checkpoint_without_revision(
     assert source["resolved_ref"] == "model-sha"
 
 
+def test_restore_optimizer_state_moves_moments_to_device() -> None:
+    from edge_lipsync.training import restore_optimizer_state
+
+    source_model = torch.nn.Linear(2, 1)
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    source_model(torch.ones(1, 2)).sum().backward()
+    source_optimizer.step()
+
+    target_model = torch.nn.Linear(2, 1)
+    target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    restore_optimizer_state(
+        target_optimizer,
+        source_optimizer.state_dict(),
+        device=torch.device("cpu"),
+    )
+
+    assert target_optimizer.state
+    assert all(
+        value.device.type == "cpu"
+        for state in target_optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+def test_train_resumes_metrics_and_exact_next_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import edge_lipsync.training as training
+    from edge_lipsync.checkpoint import (
+        capture_random_state,
+        make_training_resume_checkpoint,
+    )
+    from edge_lipsync.dataset import manifest_sha256
+    from edge_lipsync.hub import HubArtifact
+    from edge_lipsync.sources import ResolvedSource
+
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    manifest = dataset_root / "manifest.jsonl"
+    manifest.write_text("{}\n", encoding="utf-8")
+    run_dir = tmp_path / "resumed"
+    config = training.TrainConfig(
+        dataset_root=str(dataset_root),
+        manifest="manifest.jsonl",
+        run_dir=str(run_dir),
+        resume_hf_model_repo="owner/avatar-model",
+        device="cpu",
+        batch_size=1,
+        max_steps=3,
+        warmup_steps=0,
+        stabilization_steps=0,
+        validation_interval=10,
+        checkpoint_interval=10,
+        media_eval_on_best=False,
+    )
+
+    class IndexedDataset:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> dict[str, Any]:
+            return {
+                "face": torch.full((6, 160, 160), float(index)),
+                "audio": torch.zeros(20, 256),
+                "target": torch.ones(3, 160, 160),
+                "meta": {"sample_index": index},
+            }
+
+    source_model = _FaceAudioModel()
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=config.learning_rate)
+    source_model.bias.grad = torch.ones_like(source_model.bias)
+    source_optimizer.step()
+    source_scaler = torch.amp.GradScaler("cuda", enabled=False)
+    data_generator = torch.Generator().manual_seed(123)
+    epoch_indices = torch.randperm(2, generator=data_generator).tolist()
+    saved_generator_state = data_generator.get_state()
+    expected_generator = torch.Generator()
+    expected_generator.set_state(saved_generator_state)
+    next_epoch_indices = torch.randperm(2, generator=expected_generator).tolist()
+    best_state = {
+        key: value.detach().clone()
+        for key, value in source_model.state_dict().items()
+    }
+    checkpoint_path = tmp_path / "resume_latest.pt"
+    torch.save(
+        make_training_resume_checkpoint(
+            model=source_model,
+            optimizer=source_optimizer,
+            scaler=source_scaler,
+            training_config=asdict(config),
+            dataset_identity={
+                "kind": "manifest",
+                "manifest_sha256": manifest_sha256(manifest),
+            },
+            dataset_root=dataset_root,
+            manifest_path=manifest,
+            runtime={"device_type": "cpu", "mixed_precision": False},
+            step=1,
+            epoch=1,
+            next_batch_index=1,
+            epoch_sample_indices=epoch_indices,
+            data_order_generator_state=saved_generator_state,
+            best_val_loss=0.2,
+            early_stopping_best_val_loss=0.2,
+            validations_without_improvement=0,
+            best_metrics={"step": 1, "epoch": 1, "val_loss": 0.2},
+            best_model_state_dict=best_state,
+            metrics_history=[
+                {
+                    "step": 1,
+                    "epoch": 1,
+                    "phase": "main",
+                    "learning_rate": config.learning_rate,
+                    "train_loss": 1.0,
+                    "val_loss": 0.2,
+                }
+            ],
+            random_state=capture_random_state(),
+            init_weight_source={"kind": "ncnn_bin", "path": "/tmp/dh_model.bin"},
+            provenance={"dataset": {"source": "local"}},
+        ),
+        checkpoint_path,
+    )
+
+    monkeypatch.setattr(training, "DuixManifestDataset", IndexedDataset)
+    monkeypatch.setattr(training, "DuixUNet", _FaceAudioModel)
+    monkeypatch.setattr(
+        training,
+        "resolve_dataset_source",
+        lambda **_kwargs: ResolvedSource(
+            path=dataset_root,
+            provenance={"source": "local", "path": str(dataset_root)},
+        ),
+    )
+    monkeypatch.setattr(
+        training,
+        "pull_model_checkpoint",
+        lambda *args, **kwargs: HubArtifact(
+            repo_id=str(args[0]),
+            requested_ref=str(kwargs.get("ref", "")),
+            resolved_ref="resume-sha",
+            path=checkpoint_path,
+            url="https://huggingface.co/owner/avatar-model/tree/resume-sha",
+        ),
+    )
+    seen_indices: list[int] = []
+    original_train_step = training.run_train_step
+
+    def recording_train_step(**kwargs: Any) -> float:
+        seen_indices.extend(
+            int(meta["sample_index"])
+            for meta in kwargs["batch"]["meta"]
+        )
+        return original_train_step(**kwargs)
+
+    monkeypatch.setattr(training, "run_train_step", recording_train_step)
+
+    training.train(config)
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    best_checkpoint = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    assert [row["step"] for row in metrics] == [1, 2, 3]
+    assert seen_indices == [epoch_indices[1], next_epoch_indices[0]]
+    assert torch.equal(best_checkpoint["state_dict"]["bias"], best_state["bias"])
+
+
 def test_prepare_training_datasets_pulls_revision_then_loads_from_disk(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
