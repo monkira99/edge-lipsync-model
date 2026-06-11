@@ -252,6 +252,27 @@ def test_phase_for_step_covers_warmup_main_and_stabilization() -> None:
     assert phase_for_step(9, **kwargs) == "stabilization"
 
 
+def test_generate_epoch_sample_indices_uses_dedicated_generator() -> None:
+    from edge_lipsync.training import generate_epoch_sample_indices
+
+    expected_generator = torch.Generator().manual_seed(123)
+    expected = torch.randperm(5, generator=expected_generator).tolist()
+    generator = torch.Generator().manual_seed(123)
+
+    assert generate_epoch_sample_indices(5, generator) == expected
+    assert torch.equal(generator.get_state(), expected_generator.get_state())
+
+
+def test_remaining_epoch_sample_indices_starts_at_next_batch() -> None:
+    from edge_lipsync.training import remaining_epoch_sample_indices
+
+    assert remaining_epoch_sample_indices(
+        [4, 1, 3, 0, 2],
+        batch_size=2,
+        next_batch_index=2,
+    ) == [2]
+
+
 def test_mixed_precision_rejects_cpu_device() -> None:
     from edge_lipsync.training import TrainConfig, use_mixed_precision
 

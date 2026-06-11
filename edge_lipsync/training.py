@@ -259,6 +259,28 @@ def validate_batch_shapes(batch: dict[str, Any]) -> None:
             )
 
 
+def generate_epoch_sample_indices(
+    dataset_size: int,
+    generator: torch.Generator,
+) -> list[int]:
+    if dataset_size <= 0:
+        raise ValueError("Training dataset must be non-empty")
+    return torch.randperm(dataset_size, generator=generator).tolist()
+
+
+def remaining_epoch_sample_indices(
+    epoch_sample_indices: list[int],
+    *,
+    batch_size: int,
+    next_batch_index: int,
+) -> list[int]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if next_batch_index < 0:
+        raise ValueError("next_batch_index must be non-negative")
+    return epoch_sample_indices[next_batch_index * batch_size :]
+
+
 def collate_training_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty training batch")
@@ -943,12 +965,13 @@ def train(config: TrainConfig) -> Path:
     provenance["wandb"] = tracker.provenance
     try:
         mixed_precision = use_mixed_precision(config, device)
-        train_loader = DataLoader(
+        shape_loader = DataLoader(
             prepared_data.train_dataset,
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=False,
             num_workers=config.num_workers,
             collate_fn=collate_training_batch,
+            generator=torch.Generator().manual_seed(0),
         )
         val_loader = DataLoader(
             prepared_data.val_dataset,
@@ -957,7 +980,7 @@ def train(config: TrainConfig) -> Path:
             num_workers=config.num_workers,
             collate_fn=collate_training_batch,
         )
-        validate_batch_shapes(next(iter(train_loader)))
+        validate_batch_shapes(next(iter(shape_loader)))
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=config.learning_rate,
@@ -992,12 +1015,39 @@ def train(config: TrainConfig) -> Path:
         step = 0
         epoch = 0
         active_phase = ""
+        data_order_generator = torch.Generator().manual_seed(torch.initial_seed())
+        epoch_sample_indices: list[int] = []
+        next_batch_index = 0
     except Exception:
         tracker.finish(exit_code=1)
         raise
     try:
         while step < config.max_steps and not early_stop_reason:
-            epoch += 1
+            epoch_batch_count = (
+                len(epoch_sample_indices) + config.batch_size - 1
+            ) // config.batch_size
+            if not epoch_sample_indices or next_batch_index >= epoch_batch_count:
+                epoch += 1
+                epoch_sample_indices = generate_epoch_sample_indices(
+                    len(prepared_data.train_dataset),
+                    data_order_generator,
+                )
+                next_batch_index = 0
+            remaining_indices = remaining_epoch_sample_indices(
+                epoch_sample_indices,
+                batch_size=config.batch_size,
+                next_batch_index=next_batch_index,
+            )
+            train_loader = DataLoader(
+                Subset(prepared_data.train_dataset, remaining_indices),
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers,
+                collate_fn=collate_training_batch,
+                generator=torch.Generator().manual_seed(
+                    (epoch << 32) + next_batch_index
+                ),
+            )
             for batch in train_loader:
                 step += 1
                 phase = phase_for_step(
@@ -1135,6 +1185,7 @@ def train(config: TrainConfig) -> Path:
                         ),
                         run_dir / f"step_{step:07d}.pt",
                     )
+                next_batch_index += 1
                 metrics.append(row)
                 if not row_logged:
                     tracker.log_metrics(row, step=step)
